@@ -1561,6 +1561,126 @@ async def api_support(uid, user, body):
     return {"ok": True}
 
 
+async def admin_payload(extra=None):
+    users = await db.select("ox_users", {"select": "tg_id", "limit": "100000"})
+    orders = await db.select("ox_orders", {"select": "stars,status", "limit": "100000"})
+    tickets = await db.select("ox_tickets", {"status": "eq.open", "select": "id"})
+    banned = await db.select("ox_users", {"banned": "eq.true", "select": "tg_id,username", "limit": "50"})
+    links = []
+    if CFG.get("links"):
+        rows = await db.select("profiles", {"id": "in.(" + ",".join(CFG["links"].values()) + ")", "select": "id,phone,username"})
+        by = {x["id"]: x for x in rows}
+        for tg_id, pid in CFG["links"].items():
+            p = by.get(pid)
+            links.append({"tg": tg_id, "label": f"{p['phone']} {p.get('username') or ''}".strip() if p else "профиль не найден"})
+    done = [o for o in orders if o["status"] == "granted"]
+    return {"ok": True, "prices": CFG["prices"], "hidden": CFG["hidden"], "admin": {
+        "maintenance": CFG["maintenance"], "messenger_url": CFG.get("messenger_url", ""),
+        "stats": {"users": len(users), "banned": len(BANNED), "orders": len(done),
+                  "stars": sum(o["stars"] or 0 for o in done), "tickets": len(tickets)},
+        "banned": banned, "admins": {"main": sorted(MAIN_ADMINS), "extra": sorted(DB_ADMINS)}, "links": links}}
+
+
+async def broadcast(text: str):
+    users = await db.select("ox_users", {"banned": "eq.false", "select": "tg_id", "limit": "100000"})
+    for u in users:
+        try:
+            await bot.send_message(u["tg_id"], esc(text))
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+
+
+@api_route
+async def api_admin(uid, user, body):
+    if not is_admin(uid):
+        raise ApiError("Нет доступа")
+    op, P = body.get("op"), CFG["prices"]
+    if op == "price":
+        key, v = str(body.get("key")), body.get("value")
+        if v is not None:
+            v = int(v)
+            if not 1 <= v <= 100000:
+                raise ApiError("Цена: от 1 до 100000 или прочерк")
+        if key.startswith("prem:") and key[5:] in P["premium"]:
+            P["premium"][key[5:]] = v
+        elif key.startswith("coin:"):
+            P["coins"][int(key[5:])]["stars"] = v
+        elif key in ("num_rand", "num_custom", "username"):
+            P[key] = v
+        else:
+            raise ApiError("Неизвестная цена")
+        await save_cfg()
+    elif op == "hide":
+        if body.get("key") not in SECTIONS:
+            raise ApiError("Неизвестный раздел")
+        CFG["hidden"][body["key"]] = not hidden(body["key"])
+        await save_cfg()
+    elif op == "mt":
+        if "on" in body:
+            CFG["maintenance"]["on"] = bool(body["on"])
+        if body.get("text"):
+            CFG["maintenance"]["text"] = str(body["text"]).strip()[:1000]
+        await save_cfg()
+    elif op == "url":
+        u = str(body.get("url", "")).strip()
+        if u and not u.startswith("https://"):
+            raise ApiError("Ссылка должна начинаться с https://")
+        CFG["messenger_url"] = u
+        await save_cfg()
+    elif op in ("ban", "unban"):
+        tid = await find_user(str(body.get("q", "")))
+        if not tid:
+            raise ApiError("Пользователь не найден (он должен был запускать бота)")
+        if op == "ban" and is_admin(tid):
+            raise ApiError("Нельзя банить администратора")
+        await db.insert("ox_users", {"tg_id": tid, "banned": op == "ban"}, upsert=True, conflict="tg_id")
+        (BANNED.add if op == "ban" else BANNED.discard)(tid)
+    elif op in ("adm_add", "adm_del"):
+        tid = await find_user(str(body.get("q", "")))
+        if not tid:
+            raise ApiError("Пользователь не найден (он должен был запускать бота)")
+        if op == "adm_add":
+            await db.insert("ox_admins", {"tg_id": tid, "added_by": uid}, upsert=True, conflict="tg_id")
+            DB_ADMINS.add(tid)
+        else:
+            if uid not in MAIN_ADMINS:
+                raise ApiError("Удалять админов может только главный админ")
+            if tid in MAIN_ADMINS:
+                raise ApiError("Главного админа удалить нельзя")
+            await db.delete("ox_admins", {"tg_id": tid})
+            DB_ADMINS.discard(tid)
+    elif op == "lk_add":
+        tid, q = str(body.get("id", "")).strip(), str(body.get("q", "")).strip()
+        if not tid.isdigit() or not q:
+            raise ApiError("Укажите Telegram ID и номер или @юзернейм")
+        prof = None
+        if q.startswith("@"):
+            rows = await db.select("profiles", {"username": f"ilike.{q}", "select": "id,username", "limit": "5"})
+            prof = next((x for x in rows if (x.get("username") or "").lower() == q.lower()), None)
+        else:
+            digits = re.sub(r"\D", "", q)
+            if len(digits) >= 3:
+                rows = await db.select("profiles", {"phone": "like.*" + "*".join(digits) + "*", "select": "id,phone", "limit": "50"})
+                prof = next((x for x in rows if re.sub(r"\D", "", x.get("phone") or "") == digits), None)
+        if not prof:
+            raise ApiError("Профиль на сайте не найден")
+        CFG.setdefault("links", {})[tid] = prof["id"]
+        await save_cfg()
+    elif op == "lk_del":
+        if CFG.get("links", {}).pop(str(body.get("id")), None) is None:
+            raise ApiError("Такой привязки нет")
+        await save_cfg()
+    elif op == "bc":
+        text = str(body.get("text", "")).strip()[:3500]
+        if len(text) < 2:
+            raise ApiError("Введите текст")
+        asyncio.create_task(broadcast(text))
+    elif op != "get":
+        raise ApiError("Неизвестная операция")
+    return await admin_payload()
+
+
 async def serve_app(_):
     try:
         with open(APP_FILE, encoding="utf-8") as f:
@@ -1594,7 +1714,7 @@ async def main():
     app.router.add_get("/health", health)
     app.router.add_get("/app", serve_app)
     for name, fn in (("state", api_state), ("reg_start", api_reg_start), ("reg_code", api_reg_code),
-                     ("pay", api_pay), ("support", api_support)):
+                     ("pay", api_pay), ("support", api_support), ("admin", api_admin)):
         app.router.add_post(f"/api/{name}", fn)
     runner = web.AppRunner(app)
     await runner.setup()
