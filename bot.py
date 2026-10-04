@@ -82,6 +82,7 @@ DEFAULT_CFG = {
     "maintenance": {"on": False, "text": "🛠 В боте идут технические работы. Скоро вернёмся!"},
     "hidden": {},
     "messenger_url": "",
+    "links": {},  # tg_id -> id профиля на сайте (ручная привязка существующих аккаунтов)
     "prices": {
         "num_rand": None, "num_custom": None, "username": None,
         "premium": {"7": 45, "30": 100, "90": 180, "180": 250, "360": 400},
@@ -251,6 +252,7 @@ SUB_TEXT = "Для использования бота подпишись на �
 
 
 PENDING = "orenix_pending"   # та же таблица, что читает сайт (id, user_id, phone, code, entered_at, notified)
+PROFILE_FIELDS = "id,phone,username,display_name,balance,is_premium,premium_until,is_deleted"
 CODE_AT: dict = {}   # tg_id -> время выдачи кода
 REG_MSG: dict = {}   # tg_id -> (chat_id, message_id) экрана с номером
 
@@ -273,11 +275,15 @@ def pend_label(row) -> str:  # как сайт пишет номер в profiles
 async def get_profile(tg_id: int):
     """Есть заявка на номер от этого tg-аккаунта И на сайте уже создан профиль с этим номером."""
     try:
+        pid = CFG.get("links", {}).get(str(tg_id))
+        if pid:  # аккаунт привязан вручную через админ-панель
+            r = await db.select("profiles", {"id": f"eq.{pid}", "limit": "1", "select": PROFILE_FIELDS})
+            if r:
+                return r[0]
         row = await get_pending(tg_id)
         if not row:
             return None
-        r = await db.select("profiles", {"phone": f"eq.{pend_label(row)}", "limit": "1",
-                                         "select": "id,phone,username,display_name,balance,is_premium,premium_until,is_deleted"})
+        r = await db.select("profiles", {"phone": f"eq.{pend_label(row)}", "limit": "1", "select": PROFILE_FIELDS})
         return r[0] if r else None
     except Exception as e:
         log.error("get_profile: %s", e)
@@ -358,6 +364,7 @@ class S(StatesGroup):
     rand_region = State(); cust_region = State(); cust_digits = State(); username = State(); support = State()
     adm_reply = State(); adm_price = State(); adm_ban = State(); adm_unban = State()
     adm_addadm = State(); adm_rmadm = State(); adm_mt_text = State(); adm_bc = State(); adm_link = State()
+    adm_lnk_add = State(); adm_lnk_del = State()
 
 
 CANCEL = kb([B("✖️ Отмена", "m:main")])
@@ -862,6 +869,7 @@ def admin_kb():
               [B("🛠 Тех. работы", "ad:mt"), B("📊 Статистика", "ad:stats")],
               [B("🚫 Баны", "ad:ban"), B("👮 Админы", "ad:adm")],
               [B("📢 Рассылка", "ad:bc"), B("🌐 Ссылка на МС", "ad:link")],
+              [B("🔗 Привязка аккаунтов", "ad:links")],
               [B("← Меню", "m:main")])
 
 
@@ -1112,6 +1120,84 @@ async def ad_stats(c: CallbackQuery):
     await show(c, f"📊 <b>Статистика</b>\n\n👥 Пользователей: {len(users)}\n🚫 В бане: {len(BANNED)}\n"
                   f"🧾 Заказов: {len(done)}\n⭐ Звёзд получено: {sum(o['stars'] or 0 for o in done)}\n💬 Открытых обращений: {len(tickets)}",
                BACK_AD)
+
+
+# --- привязка существующих аккаунтов ---
+async def links_text():
+    links = CFG.get("links", {})
+    if not links:
+        return "🔗 <b>Привязка аккаунтов</b>\n\nПривязок нет."
+    rows = await db.select("profiles", {"id": "in.(" + ",".join(links.values()) + ")", "select": "id,phone,username"})
+    by_id = {x["id"]: x for x in rows}
+    lines = []
+    for tg, pid in links.items():
+        p = by_id.get(pid)
+        lines.append(f"• <code>{tg}</code> → {esc(p['phone'])} {esc(p.get('username') or '')}" if p
+                     else f"• <code>{tg}</code> → профиль не найден")
+    return "🔗 <b>Привязка аккаунтов</b>\n\n" + "\n".join(lines)
+
+
+def links_kb():
+    return kb([B("➕ Привязать", "lk:add"), B("➖ Убрать", "lk:del")], [B("← Админ-панель", "ad:main")])
+
+
+@ar.callback_query(F.data == "ad:links")
+async def ad_links(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.answer()
+    await show(c, await links_text(), links_kb())
+
+
+@ar.callback_query(F.data == "lk:add")
+async def lk_add(c: CallbackQuery, state: FSMContext):
+    await state.set_state(S.adm_lnk_add)
+    await c.answer()
+    await show(c, "Отправьте одним сообщением: <b>Telegram ID</b> и <b>номер или @юзернейм</b> аккаунта на сайте.\n\n"
+                  "Пример:\n<code>5570425300 +7 912 345 678 9</code>\n<code>5570425300 @username</code>",
+               kb([B("✖️ Отмена", "ad:links")]))
+
+
+@ar.message(S.adm_lnk_add, F.text)
+async def lk_add_do(m: Message, state: FSMContext):
+    parts = m.text.strip().split(None, 1)
+    if len(parts) != 2 or not parts[0].isdigit():
+        return await m.answer("Формат: <code>ID номер</code>, например <code>5570425300 +7 912 345 678 9</code>")
+    tid, q = parts[0], parts[1].strip()
+    prof = None
+    if q.startswith("@"):
+        rows = await db.select("profiles", {"username": f"ilike.{q}", "select": "id,phone,username", "limit": "5"})
+        prof = next((x for x in rows if (x.get("username") or "").lower() == q.lower()), None)
+    else:
+        digits = re.sub(r"\D", "", q)
+        if len(digits) >= 3:
+            rows = await db.select("profiles", {"phone": "like.*" + "*".join(digits) + "*",
+                                                "select": "id,phone,username", "limit": "50"})
+            prof = next((x for x in rows if re.sub(r"\D", "", x.get("phone") or "") == digits), None)
+    if not prof:
+        return await m.answer("Профиль на сайте не найден. Проверьте номер или @юзернейм и отправьте ещё раз.")
+    CFG.setdefault("links", {})[tid] = prof["id"]
+    await save_cfg()
+    await state.clear()
+    await m.answer(f"✅ Telegram <code>{tid}</code> привязан к {esc(prof['phone'])} {esc(prof.get('username') or '')}",
+                   reply_markup=kb([B("← Привязки", "ad:links")]))
+
+
+@ar.callback_query(F.data == "lk:del")
+async def lk_del(c: CallbackQuery, state: FSMContext):
+    await state.set_state(S.adm_lnk_del)
+    await c.answer()
+    await show(c, "Отправьте Telegram ID, у которого нужно убрать привязку:", kb([B("✖️ Отмена", "ad:links")]))
+
+
+@ar.message(S.adm_lnk_del, F.text)
+async def lk_del_do(m: Message, state: FSMContext):
+    tid = m.text.strip()
+    if tid not in CFG.get("links", {}):
+        return await m.answer("Такой привязки нет. Отправьте Telegram ID из списка.")
+    CFG["links"].pop(tid)
+    await save_cfg()
+    await state.clear()
+    await m.answer("✅ Привязка убрана", reply_markup=kb([B("← Привязки", "ad:links")]))
 
 
 # --- рассылка ---
