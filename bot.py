@@ -1,6 +1,7 @@
 """Orenix Bot — aiogram 3 + Supabase (REST). Секреты берутся ТОЛЬКО из переменных окружения."""
 import asyncio
 import html
+import json
 import logging
 import os
 import random
@@ -105,17 +106,28 @@ def deep_merge(base, extra):
     return out
 
 
+CFG_KEY = "orenix_config"  # свой ключ, чтобы не пересекаться со старыми записями в bot_settings
+
+
 async def load_cfg():
-    rows = await db.select("bot_settings", {"key": "eq.config"})
+    rows = await db.select("bot_settings", {"key": f"eq.{CFG_KEY}"})
+    saved = rows[0]["value"] if rows else {}
+    if isinstance(saved, str):  # если колонка value текстовая
+        try:
+            saved = json.loads(saved)
+        except Exception:
+            saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
     CFG.clear()
-    CFG.update(deep_merge(DEFAULT_CFG, rows[0]["value"] if rows else {}))
+    CFG.update(deep_merge(DEFAULT_CFG, saved))
     # списки не мёрджим — берём сохранённые целиком
-    if rows and isinstance(rows[0]["value"].get("prices", {}).get("coins"), list):
-        CFG["prices"]["coins"] = rows[0]["value"]["prices"]["coins"]
+    if isinstance(saved.get("prices", {}).get("coins"), list):
+        CFG["prices"]["coins"] = saved["prices"]["coins"]
 
 
 async def save_cfg():
-    await db.insert("bot_settings", {"key": "config", "value": CFG}, upsert=True, conflict="key")
+    await db.insert("bot_settings", {"key": CFG_KEY, "value": CFG}, upsert=True, conflict="key")
 
 
 def is_admin(uid: int) -> bool:
