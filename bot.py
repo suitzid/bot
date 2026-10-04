@@ -675,14 +675,14 @@ async def sh_username(c: CallbackQuery, state: FSMContext):
         return await c.answer("⏳ Цена пока не установлена", show_alert=True)
     await state.set_state(S.username)
     await c.answer()
-    await show(c, f"🏷 <b>NFT-юзернейм</b> — {ps(price)}\n\nВведите желаемый юзернейм (латиница, цифры, _; до 32 символов):", CANCEL)
+    await show(c, f"🏷 <b>NFT-юзернейм</b> — {ps(price)}\n\nВведите желаемый юзернейм (латиница, цифры, _; от 4 до 10 символов):", CANCEL)
 
 
 @r.message(S.username, F.text)
 async def username_in(m: Message, state: FSMContext):
     name = m.text.strip().lstrip("@")
-    if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", name):
-        return await m.answer("Только латиница, цифры и _ (1–32 символа). Введите ещё раз:", reply_markup=CANCEL)
+    if not re.fullmatch(r"[A-Za-z0-9_]{4,10}", name):
+        return await m.answer("Только латиница, цифры и _, от 4 до 10 символов. Введите ещё раз:", reply_markup=CANCEL)
     if not await item_free("username", name):
         return await m.answer(f"❌ Юзернейм <code>@{esc(name)}</code> занят. Введите другой:", reply_markup=CANCEL)
     price = CFG["prices"]["username"]
