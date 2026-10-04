@@ -77,7 +77,7 @@ class DB:
 db = DB()
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-# ───────────────────────── конфиг (хранится в bot_settings) ─────────────────────────
+# ───────────────────────── конфиг (хранится в ox_settings) ─────────────────────────
 DEFAULT_CFG = {
     "maintenance": {"on": False, "text": "🛠 В боте идут технические работы. Скоро вернёмся!"},
     "hidden": {},
@@ -106,11 +106,11 @@ def deep_merge(base, extra):
     return out
 
 
-CFG_KEY = "orenix_config"  # свой ключ, чтобы не пересекаться со старыми записями в bot_settings
+CFG_KEY = "orenix_config"  # свой ключ, чтобы не пересекаться со старыми записями в ox_settings
 
 
 async def load_cfg():
-    rows = await db.select("bot_settings", {"key": f"eq.{CFG_KEY}"})
+    rows = await db.select("ox_settings", {"key": f"eq.{CFG_KEY}"})
     saved = rows[0]["value"] if rows else {}
     if isinstance(saved, str):  # если колонка value текстовая
         try:
@@ -127,7 +127,7 @@ async def load_cfg():
 
 
 async def save_cfg():
-    await db.insert("bot_settings", {"key": CFG_KEY, "value": CFG}, upsert=True, conflict="key")
+    await db.insert("ox_settings", {"key": CFG_KEY, "value": CFG}, upsert=True, conflict="key")
 
 
 def is_admin(uid: int) -> bool:
@@ -195,7 +195,7 @@ def gen_digits(n, max_same, no_adjacent=False, first="0123456789"):
 
 
 async def item_free(kind, value) -> bool:
-    return bool(await db.rpc("bot_item_free", {"p_kind": kind, "p_value": value}))
+    return bool(await db.rpc("ox_item_free", {"p_kind": kind, "p_value": value}))
 
 
 def parse_dt(s):
@@ -218,7 +218,7 @@ async def touch_user(u, force=False):
         return
     KNOWN.add(u.id)
     try:
-        await db.insert("bot_users", {"tg_id": u.id, "username": u.username, "first_name": u.first_name,
+        await db.insert("ox_users", {"tg_id": u.id, "username": u.username, "first_name": u.first_name,
                                       "last_seen": datetime.now(timezone.utc).isoformat()},
                         upsert=True, conflict="tg_id")
     except Exception as e:
@@ -250,14 +250,47 @@ def sub_kb():
 SUB_TEXT = "Для использования бота подпишись на наш канал, затем нажми «Я подписался»."
 
 
+PENDING = "orenix_pending"   # та же таблица, что читает сайт (id, user_id, phone, code, entered_at, notified)
+CODE_AT: dict = {}   # tg_id -> время выдачи кода
+REG_MSG: dict = {}   # tg_id -> (chat_id, message_id) экрана с номером
+
+
+async def get_pending(uid: int):
+    rows = await db.select(PENDING, {"user_id": f"eq.{uid}", "order": "id.desc", "limit": "1"})
+    return rows[0] if rows else None
+
+
+def pend_parts(row):
+    phone = row["phone"]  # '+7' + 10 цифр
+    return phone[:2], phone[2:]
+
+
+def pend_label(row) -> str:  # как сайт пишет номер в profiles.phone: '+7 912 345 678 9'
+    region, body = pend_parts(row)
+    return f"{region} {grouped(body)}"
+
+
 async def get_profile(tg_id: int):
+    """Есть заявка на номер от этого tg-аккаунта И на сайте уже создан профиль с этим номером."""
     try:
-        r = await db.select("profiles", {"tg_id": f"eq.{tg_id}", "limit": "1",
+        row = await get_pending(tg_id)
+        if not row:
+            return None
+        r = await db.select("profiles", {"phone": f"eq.{pend_label(row)}", "limit": "1",
                                          "select": "id,phone,username,display_name,balance,is_premium,premium_until,is_deleted"})
         return r[0] if r else None
     except Exception as e:
         log.error("get_profile: %s", e)
         return None
+
+
+async def number_taken(region: str, body: str) -> bool:
+    if await db.select(PENDING, {"phone": f"eq.{region}{body}", "select": "id", "limit": "1"}):
+        return True
+    label = f"{region} {grouped(body)}"
+    if await db.select("profiles", {"phone": f"eq.{label}", "select": "id", "limit": "1"}):
+        return True
+    return not await item_free("phone", label)
 
 
 # ───────────────────────── middleware: бан / тех.работы / подписка ─────────────────────────
@@ -360,9 +393,14 @@ async def account_entry(c: CallbackQuery):
     if not await guard(c, "get_number" if c.data == "gn" else "profile"):
         return
     await c.answer()
-    prof = await get_profile(c.from_user.id)
+    uid = c.from_user.id
+    prof = await get_profile(uid)
     if prof:
         return await show_profile(c, prof)
+    row = await get_pending(uid)
+    if row:  # номер уже выдан, регистрация на сайте ещё не завершена
+        REG_MSG[uid] = (c.message.chat.id, c.message.message_id)
+        return await show(c, reg_text(row), reg_kb(row))
     await show(c, "🌍 <b>Выберите регион номера:</b>",
                kb([B("🇷🇺 +7", "reg:7"), B("🇺🇸 +1", "reg:1")], [B("← Меню", "m:main")]))
 
@@ -382,10 +420,10 @@ def premium_text(p) -> str:
 async def show_profile(ev, prof):
     phones, names = [prof.get("phone")], [prof.get("username")]
     try:
-        for x in await db.select("bot_owned", {"user_id": f"eq.{prof['id']}", "select": "kind,value", "order": "id"}):
+        for x in await db.select("ox_owned", {"user_id": f"eq.{prof['id']}", "select": "kind,value", "order": "id"}):
             (phones if x["kind"] == "phone" else names).append(x["value"])
     except Exception as e:
-        log.warning("bot_owned: %s", e)
+        log.warning("ox_owned: %s", e)
     for fn, args, field, dst in (("extra_phones_for", {"p_ids": [prof["id"]]}, "phone", phones),
                                  ("extra_usernames_for", {"p_type": "user", "p_ids": [prof["id"]]}, "username", names)):
         try:
@@ -409,113 +447,120 @@ async def show_profile(ev, prof):
     await show(ev, text, kb([B("🛒 Магазин", "shop")], [B("← Меню", "m:main")]))
 
 
-def reg_text(s):
+def reg_text(row):
+    region, body = pend_parts(row)
     return ("📱 <b>Ваш номер</b>\n\n"
-            f"Регион: <code>+{s['region']}</code>\nНомер: <code>{s['phone'][len(s['region']) + 1:]}</code>\n\n"
+            f"Регион: <code>{region}</code>\nНомер: <code>{body}</code>\n\n"
             "1️⃣ Откройте Orenix Messenger → «Регистрация»\n"
             "2️⃣ Введите регион и номер, нажмите «Далее»\n"
             "3️⃣ Вернитесь сюда — кнопка «Получить код» станет активной.")
 
 
-def reg_kb(s):
+def reg_kb(row):
     url = CFG.get("messenger_url")
-    return kb([B("🔑 Получить код", "code:get") if s["entered"] else B("🔒 Получить код", "code:wait")],
+    return kb([B("🔑 Получить код", "code:get") if row.get("entered_at") else B("🔒 Получить код", "code:wait")],
               [B("🌐 Открыть мессенджер", url=url)] if url else [],
-              [B("🔁 Другой номер", f"reg:{s['region']}"), B("← Меню", "m:main")])
+              [B("← Меню", "m:main")])
 
 
 @r.callback_query(F.data.startswith("reg:"))
 async def reg_number(c: CallbackQuery):
     if not await guard(c, "get_number"):
         return
-    if await get_profile(c.from_user.id):
+    uid = c.from_user.id
+    if await get_profile(uid):
         await c.answer()
         return await show(c, "У вас уже есть аккаунт 👍", kb([B("👤 Профиль", "pf")]))
-    code = c.data.split(":")[1]
-    if code not in ("7", "1"):
-        return await c.answer()
-    for _ in range(40):
-        digits = gen_digits(10, 3, no_adjacent=True, first="23456789")
-        if await item_free("phone", label_of(code, digits)):
-            break
-    else:
-        return await c.answer("Не удалось подобрать номер, попробуйте ещё раз", show_alert=True)
-    row = {"tg_id": c.from_user.id, "phone": f"+{code}{digits}", "region": code, "entered": False, "code": None,
-           "code_exp": None, "verified": False, "linked": False, "notified_entered": False, "notified_done": False,
-           "chat_id": c.message.chat.id, "msg_id": c.message.message_id,
-           "created_at": datetime.now(timezone.utc).isoformat()}
-    await db.insert("bot_sessions", row, upsert=True, conflict="tg_id")
+    row = await get_pending(uid)  # один номер на аккаунт — как в рабочей версии
+    if not row:
+        code = c.data.split(":")[1]
+        if code not in ("7", "1"):
+            return await c.answer()
+        region = "+" + code
+        for _ in range(40):
+            body = gen_digits(10, 3, no_adjacent=True, first="23456789")
+            if await number_taken(region, body):
+                continue
+            try:
+                row = (await db.insert(PENDING, {"user_id": uid, "phone": region + body, "code": None,
+                                                 "entered_at": None, "notified": False}))[0]
+                break
+            except RuntimeError as e:
+                if any(x in str(e).lower() for x in ("409", "duplicate", "unique")):
+                    row = await get_pending(uid)
+                    if row:
+                        break
+                    continue
+                raise
+        if not row:
+            return await c.answer("Не удалось подобрать номер, попробуйте ещё раз", show_alert=True)
+    REG_MSG[uid] = (c.message.chat.id, c.message.message_id)
     await c.answer()
     await show(c, reg_text(row), reg_kb(row))
 
 
-async def get_session(uid):
-    rows = await db.select("bot_sessions", {"tg_id": f"eq.{uid}", "limit": "1"})
-    return rows[0] if rows else None
-
-
 @r.callback_query(F.data == "code:wait")
 async def code_wait(c: CallbackQuery):
-    s = await get_session(c.from_user.id)
-    if not s:
-        return await c.answer("Сессия истекла — получите номер заново", show_alert=True)
-    if s["entered"]:
+    row = await get_pending(c.from_user.id)
+    if not row:
+        return await c.answer("Сначала получите номер", show_alert=True)
+    if row.get("entered_at"):
         await c.answer()
-        return await show(c, reg_text(s), reg_kb(s))
+        return await show(c, reg_text(row), reg_kb(row))
     await c.answer("Сначала введите номер на сайте мессенджера и нажмите «Далее».", show_alert=True)
 
 
 @r.callback_query(F.data == "code:back")
 async def code_back(c: CallbackQuery):
-    s = await get_session(c.from_user.id)
+    row = await get_pending(c.from_user.id)
     await c.answer()
-    if s:
-        await show(c, reg_text(s), reg_kb(s))
+    if row:
+        await show(c, reg_text(row), reg_kb(row))
 
 
 @r.callback_query(F.data == "code:get")
 async def code_get(c: CallbackQuery):
-    s = await get_session(c.from_user.id)
-    if not s:
-        return await c.answer("Сессия истекла — получите номер заново", show_alert=True)
-    if not s["entered"]:
+    uid = c.from_user.id
+    row = await get_pending(uid)
+    if not row:
+        return await c.answer("Сначала получите номер", show_alert=True)
+    if not row.get("entered_at"):
         return await c.answer("Сначала введите номер на сайте и нажмите «Далее».", show_alert=True)
-    code = f"{random.randint(0, 9999):04d}"
-    exp = datetime.now(timezone.utc) + timedelta(minutes=5)
-    await db.update("bot_sessions", {"tg_id": c.from_user.id},
-                    {"code": code, "code_exp": exp.isoformat(), "verified": False, "attempts": 0})
+    code, issued = row.get("code"), CODE_AT.get(uid)
+    if not code or (issued and time.time() - issued > 300):  # код живёт 5 минут
+        code = f"{random.randint(0, 9999):04d}"
+        await db.update(PENDING, {"id": row["id"]}, {"code": code})
+        CODE_AT[uid] = issued = time.time()
+    elif not issued:
+        CODE_AT[uid] = issued = time.time()
+    left = max(0, 300 - int(time.time() - issued))
     await c.answer()
     await show(c, f"🔑 <b>Код подтверждения</b>\n\n<code>{code}</code>\n\n"
-                  f"Номер: <code>{esc(label_of(s['region'], s['phone'][len(s['region']) + 1:]))}</code>\n"
-                  "⏱ Действует 5 минут. Введите его в мессенджере.",
-               kb([B("🔄 Новый код", "code:get")], [B("← К номеру", "code:back")]))
+                  f"Номер: <code>{esc(pend_label(row))}</code>\n"
+                  f"⏱ Действует ещё {left // 60} мин {left % 60:02d} с. Он появится на сайте автоматически — "
+                  "если нет, введите его вручную.",
+               kb([B("← К номеру", "code:back"), B("← Меню", "m:main")]))
 
 
 async def watcher():
-    """Следит за сессиями: активирует кнопку кода и сообщает об успешной регистрации."""
-    last_clean = 0
+    """Как poll_pending в рабочем боте: сайт поставил entered_at -> включаем кнопку «Получить код»."""
     while True:
         try:
-            for s in await db.select("bot_sessions", {"entered": "eq.true", "notified_entered": "eq.false"}):
-                await db.update("bot_sessions", {"tg_id": s["tg_id"]}, {"notified_entered": True})
+            rows = await db.select(PENDING, {"entered_at": "not.is.null", "code": "is.null", "notified": "eq.false",
+                                             "order": "id.asc", "limit": "50"})
+            for row in rows:
+                await db.update(PENDING, {"id": row["id"]}, {"notified": True})
+                uid = int(row["user_id"])
+                m = REG_MSG.get(uid)
                 try:
-                    await bot.edit_message_text(reg_text(s), chat_id=s["chat_id"], message_id=s["msg_id"],
-                                                reply_markup=reg_kb(s))
+                    if not m:
+                        raise LookupError
+                    await bot.edit_message_text(reg_text(row), chat_id=m[0], message_id=m[1], reply_markup=reg_kb(row))
                 except Exception:
-                    await bot.send_message(s["tg_id"], "✅ Номер введён на сайте. Теперь можно получить код.",
-                                           reply_markup=reg_kb(s))
-            for s in await db.select("bot_sessions", {"linked": "eq.true", "notified_done": "eq.false"}):
-                await db.update("bot_sessions", {"tg_id": s["tg_id"]}, {"notified_done": True})
-                try:
-                    await bot.send_message(s["tg_id"], "🎉 <b>Аккаунт Orenix создан!</b>\nТеперь доступны профиль и магазин.",
-                                           reply_markup=main_kb(s["tg_id"]))
-                except Exception:
-                    pass
-                await db.delete("bot_sessions", {"tg_id": s["tg_id"]})
-            if time.time() - last_clean > 300:
-                last_clean = time.time()
-                old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-                await db._req("DELETE", "/rest/v1/bot_sessions", params={"linked": "eq.false", "created_at": f"lt.{old}"})
+                    try:
+                        await bot.send_message(uid, "✅ Номер принят! Нажмите «Получить код».", reply_markup=reg_kb(row))
+                    except Exception as e:
+                        log.warning("notify %s: %s", uid, e)
         except Exception as e:
             log.warning("watcher: %s", e)
         await asyncio.sleep(3)
@@ -729,7 +774,7 @@ async def paid(m: Message):
     uid, payload, stars = m.from_user.id, sp.invoice_payload, sp.total_amount
     k, *a = payload.split(":")
     try:
-        await db.insert("bot_orders", {"charge_id": sp.telegram_payment_charge_id, "tg_id": uid, "kind": k,
+        await db.insert("ox_orders", {"charge_id": sp.telegram_payment_charge_id, "tg_id": uid, "kind": k,
                                        "payload": payload, "stars": stars, "status": "paid"})
     except Exception as e:
         if "409" in str(e) or "duplicate" in str(e).lower():
@@ -741,22 +786,22 @@ async def paid(m: Message):
             raise RuntimeError("profile not found")
         if k in ("numr", "numc"):
             lb = label_of(a[0], a[1])
-            if not await db.rpc("bot_grant_item", {"p_user": prof["id"], "p_tg": uid, "p_kind": "phone", "p_value": lb, "p_stars": stars}):
+            if not await db.rpc("ox_grant_item", {"p_user": prof["id"], "p_tg": uid, "p_kind": "phone", "p_value": lb, "p_stars": stars}):
                 raise RuntimeError("number taken")
             text = f"✅ Номер <code>{esc(lb)}</code> теперь на вашем аккаунте в Orenix Messenger!"
         elif k == "usr":
-            if not await db.rpc("bot_grant_item", {"p_user": prof["id"], "p_tg": uid, "p_kind": "username", "p_value": "@" + a[0], "p_stars": stars}):
+            if not await db.rpc("ox_grant_item", {"p_user": prof["id"], "p_tg": uid, "p_kind": "username", "p_value": "@" + a[0], "p_stars": stars}):
                 raise RuntimeError("username taken")
             text = f"✅ Юзернейм <code>@{esc(a[0])}</code> теперь на вашем аккаунте в Orenix Messenger!"
         elif k == "coin":
-            bal = await db.rpc("bot_add_balance", {"p_user": prof["id"], "p_amount": int(a[1])})
+            bal = await db.rpc("ox_add_balance", {"p_user": prof["id"], "p_amount": int(a[1])})
             text = f"✅ Зачислено <b>{a[1]} кк</b>. Баланс: <b>{bal}</b> кк"
         elif k == "prem":
-            until = await db.rpc("bot_grant_premium", {"p_user": prof["id"], "p_days": int(a[0])})
+            until = await db.rpc("ox_grant_premium", {"p_user": prof["id"], "p_days": int(a[0])})
             text = f"✅ Orenix Premium активен до <b>{parse_dt(until).strftime('%d.%m.%Y %H:%M')} UTC</b>"
         else:
             raise RuntimeError("unknown kind")
-        await db.update("bot_orders", {"charge_id": sp.telegram_payment_charge_id}, {"status": "granted"})
+        await db.update("ox_orders", {"charge_id": sp.telegram_payment_charge_id}, {"status": "granted"})
         await m.answer(text, reply_markup=kb([B("👤 Профиль", "pf"), B("🛒 Магазин", "shop")]))
     except Exception as e:
         log.error("fulfill failed: %s", e)
@@ -768,7 +813,7 @@ async def paid(m: Message):
             status = "failed"
             await m.answer("⚠️ Ошибка выдачи. Напишите в поддержку — всё исправим.")
             log.error("refund failed: %s", e2)
-        await db.update("bot_orders", {"charge_id": sp.telegram_payment_charge_id}, {"status": status, "error": str(e)[:300]})
+        await db.update("ox_orders", {"charge_id": sp.telegram_payment_charge_id}, {"status": status, "error": str(e)[:300]})
         for aid in MAIN_ADMINS | DB_ADMINS:
             try:
                 await bot.send_message(aid, f"⚠️ Ошибка выдачи заказа ({k}) у <code>{uid}</code>: {esc(str(e)[:200])} → {status}")
@@ -789,10 +834,10 @@ async def support(c: CallbackQuery, state: FSMContext):
 @r.message(S.support, F.text)
 async def support_msg(m: Message, state: FSMContext):
     u = m.from_user
-    tickets = await db.select("bot_tickets", {"tg_id": f"eq.{u.id}", "status": "eq.open", "limit": "1"})
-    t = tickets[0] if tickets else (await db.insert("bot_tickets", {"tg_id": u.id, "name": u.full_name}))[0]
-    await db.insert("bot_ticket_msgs", {"ticket_id": t["id"], "from_admin": False, "body": m.text})
-    await db.update("bot_tickets", {"id": t["id"]}, {"updated_at": datetime.now(timezone.utc).isoformat()})
+    tickets = await db.select("ox_tickets", {"tg_id": f"eq.{u.id}", "status": "eq.open", "limit": "1"})
+    t = tickets[0] if tickets else (await db.insert("ox_tickets", {"tg_id": u.id, "name": u.full_name}))[0]
+    await db.insert("ox_ticket_msgs", {"ticket_id": t["id"], "from_admin": False, "body": m.text})
+    await db.update("ox_tickets", {"id": t["id"]}, {"updated_at": datetime.now(timezone.utc).isoformat()})
     await state.clear()
     text = (f"📩 <b>Обращение #{t['id']}</b>\nОт: {esc(u.full_name)} {('@' + u.username) if u.username else ''} "
             f"(<code>{u.id}</code>)\n\n{esc(m.text)}")
@@ -973,7 +1018,7 @@ async def find_user(q: str):
     q = q.strip().lstrip("@")
     if q.isdigit():
         return int(q)
-    rows = await db.select("bot_users", {"username": f"ilike.{q}", "limit": "1"})
+    rows = await db.select("ox_users", {"username": f"ilike.{q}", "limit": "1"})
     return rows[0]["tg_id"] if rows else None
 
 
@@ -988,7 +1033,7 @@ async def ad_ban(c: CallbackQuery, state: FSMContext):
 @ar.callback_query(F.data == "bn:list")
 async def bn_list(c: CallbackQuery):
     await c.answer()
-    rows = await db.select("bot_users", {"banned": "eq.true", "limit": "50"})
+    rows = await db.select("ox_users", {"banned": "eq.true", "limit": "50"})
     txt = "\n".join(f"• <code>{x['tg_id']}</code> {('@' + x['username']) if x.get('username') else ''}" for x in rows) or "Список пуст"
     await show(c, f"🚫 <b>Забанены:</b>\n{txt}", kb([B("← Назад", "ad:ban")]))
 
@@ -1009,7 +1054,7 @@ async def bn_do(m: Message, state: FSMContext):
         return await m.answer("Пользователь не найден. Отправьте числовой ID или @username из базы бота.")
     if is_admin(uid):
         return await m.answer("Нельзя банить администратора.")
-    await db.insert("bot_users", {"tg_id": uid, "banned": ban}, upsert=True, conflict="tg_id")
+    await db.insert("ox_users", {"tg_id": uid, "banned": ban}, upsert=True, conflict="tg_id")
     (BANNED.add if ban else BANNED.discard)(uid)
     await state.clear()
     await m.answer(f"{'🚫 Забанен' if ban else '♻️ Разбанен'}: <code>{uid}</code>", reply_markup=kb([B("← Баны", "ad:ban")]))
@@ -1045,12 +1090,12 @@ async def am_do(m: Message, state: FSMContext):
     if not uid:
         return await m.answer("Не найден. Отправьте числовой ID или @username.")
     if add:
-        await db.insert("bot_admins", {"tg_id": uid, "added_by": m.from_user.id}, upsert=True, conflict="tg_id")
+        await db.insert("ox_admins", {"tg_id": uid, "added_by": m.from_user.id}, upsert=True, conflict="tg_id")
         DB_ADMINS.add(uid)
     else:
         if uid in MAIN_ADMINS:
             return await m.answer("Главного админа удалить нельзя.")
-        await db.delete("bot_admins", {"tg_id": uid})
+        await db.delete("ox_admins", {"tg_id": uid})
         DB_ADMINS.discard(uid)
     await state.clear()
     await m.answer(f"{'✅ Добавлен' if add else '✅ Удалён'}: <code>{uid}</code>", reply_markup=kb([B("← Админы", "ad:adm")]))
@@ -1060,9 +1105,9 @@ async def am_do(m: Message, state: FSMContext):
 @ar.callback_query(F.data == "ad:stats")
 async def ad_stats(c: CallbackQuery):
     await c.answer()
-    users = await db.select("bot_users", {"select": "tg_id", "limit": "100000"})
-    orders = await db.select("bot_orders", {"select": "stars,status", "limit": "100000"})
-    tickets = await db.select("bot_tickets", {"status": "eq.open", "select": "id"})
+    users = await db.select("ox_users", {"select": "tg_id", "limit": "100000"})
+    orders = await db.select("ox_orders", {"select": "stars,status", "limit": "100000"})
+    tickets = await db.select("ox_tickets", {"status": "eq.open", "select": "id"})
     done = [o for o in orders if o["status"] == "granted"]
     await show(c, f"📊 <b>Статистика</b>\n\n👥 Пользователей: {len(users)}\n🚫 В бане: {len(BANNED)}\n"
                   f"🧾 Заказов: {len(done)}\n⭐ Звёзд получено: {sum(o['stars'] or 0 for o in done)}\n💬 Открытых обращений: {len(tickets)}",
@@ -1090,7 +1135,7 @@ async def bc_go(c: CallbackQuery, state: FSMContext):
     if not text:
         return await c.answer("Нет текста", show_alert=True)
     await c.answer("Рассылка запущена")
-    users = await db.select("bot_users", {"banned": "eq.false", "select": "tg_id", "limit": "100000"})
+    users = await db.select("ox_users", {"banned": "eq.false", "select": "tg_id", "limit": "100000"})
     ok = 0
     for u in users:
         try:
@@ -1114,12 +1159,12 @@ async def tk_reply(c: CallbackQuery, state: FSMContext):
 @ar.message(S.adm_reply, F.text)
 async def tk_send(m: Message, state: FSMContext):
     tid = (await state.get_data())["tid"]
-    rows = await db.select("bot_tickets", {"id": f"eq.{tid}", "limit": "1"})
+    rows = await db.select("ox_tickets", {"id": f"eq.{tid}", "limit": "1"})
     if not rows:
         await state.clear()
         return await m.answer("Обращение не найдено.")
-    await db.insert("bot_ticket_msgs", {"ticket_id": tid, "from_admin": True, "admin_id": m.from_user.id, "body": m.text})
-    await db.update("bot_tickets", {"id": tid}, {"updated_at": datetime.now(timezone.utc).isoformat()})
+    await db.insert("ox_ticket_msgs", {"ticket_id": tid, "from_admin": True, "admin_id": m.from_user.id, "body": m.text})
+    await db.update("ox_tickets", {"id": tid}, {"updated_at": datetime.now(timezone.utc).isoformat()})
     await state.clear()
     try:
         await bot.send_message(rows[0]["tg_id"], f"💬 <b>Ответ поддержки (#{tid}):</b>\n\n{esc(m.text)}",
@@ -1132,7 +1177,7 @@ async def tk_send(m: Message, state: FSMContext):
 @ar.callback_query(F.data.startswith("tk:c:"))
 async def tk_close(c: CallbackQuery):
     tid = int(c.data.split(":")[2])
-    await db.update("bot_tickets", {"id": tid}, {"status": "closed"})
+    await db.update("ox_tickets", {"id": tid}, {"status": "closed"})
     await c.answer(f"Обращение #{tid} закрыто")
     try:
         await c.message.edit_reply_markup(reply_markup=None)
@@ -1164,15 +1209,45 @@ async def ensure_web_admin():
         log.warning("ensure_web_admin: %s", e)
 
 
+SCHEMA = {
+    "ox_users": "tg_id,username,first_name,banned,last_seen", "ox_settings": "key,value", "ox_admins": "tg_id,added_by",
+    "orenix_pending": "id,user_id,phone,code,entered_at,notified",
+    "ox_owned": "id,user_id,tg_id,kind,value,stars", "ox_orders": "id,charge_id,tg_id,kind,payload,stars,status,error",
+    "ox_tickets": "id,tg_id,name,status,updated_at", "ox_ticket_msgs": "id,ticket_id,from_admin,admin_id,body",
+}
+
+
+async def check_schema():
+    bad = []
+    for t, cols in SCHEMA.items():
+        try:
+            await db.select(t, {"select": cols, "limit": "1"})
+        except Exception as e:
+            bad.append(f"{t}: {str(e)[:160]}")
+    try:
+        await db.select("profiles", {"select": "id,phone,username,display_name,balance,is_premium,premium_until,is_deleted", "limit": "1"})
+    except Exception as e:
+        bad.append(f"profiles: {str(e)[:160]}")
+    try:
+        await db.rpc("ox_item_free", {"p_kind": "phone", "p_value": "+0 0"})
+    except Exception as e:
+        bad.append(f"ox_item_free: {str(e)[:160]}")
+    if bad:
+        log.error("СХЕМА БД НЕ ГОТОВА (запустите SQL-части 1-4):\n%s", "\n".join(bad))
+    else:
+        log.info("Схема БД проверена: всё на месте")
+
+
 async def health(_):
     return web.Response(text="ok")
 
 
 async def main():
+    await check_schema()
     await load_cfg()
-    for x in await db.select("bot_admins", {"select": "tg_id"}):
+    for x in await db.select("ox_admins", {"select": "tg_id"}):
         DB_ADMINS.add(x["tg_id"])
-    for x in await db.select("bot_users", {"banned": "eq.true", "select": "tg_id"}):
+    for x in await db.select("ox_users", {"banned": "eq.true", "select": "tg_id"}):
         BANNED.add(x["tg_id"])
     await ensure_web_admin()
 
