@@ -29,6 +29,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton as Btn, InlineKey
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orenix")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # не засорять логи запросами к базе
 
 # ───────────────────────── настройки (env) ─────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
