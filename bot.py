@@ -1,5 +1,7 @@
 """Orenix Bot — aiogram 3 + Supabase (REST). Секреты берутся ТОЛЬКО из переменных окружения."""
 import asyncio
+import hashlib
+import hmac
 import html
 import json
 import logging
@@ -8,6 +10,8 @@ import random
 import re
 import time
 from collections import Counter
+from types import SimpleNamespace
+from urllib.parse import parse_qsl
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -21,7 +25,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (CallbackQuery, InlineKeyboardButton as Btn, InlineKeyboardMarkup,
-                           LabeledPrice, Message, PreCheckoutQuery)
+                           LabeledPrice, MenuButtonWebApp, Message, PreCheckoutQuery, WebAppInfo)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orenix")
@@ -36,6 +40,8 @@ CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/+2QGm_H2UchgwNDJi")
 WEB_ADMIN_EMAIL = os.getenv("WEB_ADMIN_EMAIL", "")
 WEB_ADMIN_PASSWORD = os.getenv("WEB_ADMIN_PASSWORD", "")
 PORT = int(os.getenv("PORT", "10000"))
+_ext = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+APP_URL = os.getenv("MINIAPP_URL") or (_ext + "/app" if _ext else "")  # мини-апп отдаётся самим ботом
 
 esc = html.escape
 
@@ -344,6 +350,8 @@ def main_kb(uid):
     rows = [[vb("get_number", uid, "📱 Получить номер", "gn"), vb("profile", uid, "👤 Профиль", "pf")],
             [vb("shop", uid, "🛒 Магазин", "shop")],
             [vb("support", uid, "💬 Поддержка", "support")]]
+    if APP_URL:
+        rows.insert(0, [Btn(text="🚀 Открыть Mini App", web_app=WebAppInfo(url=APP_URL))])
     if is_admin(uid):
         rows.append([B("⚙️ Админ-панель", "ad:main")])
     return kb(*rows)
@@ -1324,6 +1332,242 @@ async def check_schema():
         log.info("Схема БД проверена: всё на месте")
 
 
+# ───────────────────────── Mini App API ─────────────────────────
+APP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp.html")
+
+
+class ApiError(Exception):
+    pass
+
+
+def verify_init(init: str):
+    """Проверка подписи Telegram WebApp initData. Возвращает dict пользователя или None."""
+    try:
+        pairs = dict(parse_qsl(init, keep_blank_values=True))
+        got = pairs.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, got) or time.time() - int(pairs.get("auth_date", 0)) > 86400:
+            return None
+        return json.loads(pairs["user"])
+    except Exception:
+        return None
+
+
+async def profile_lists(prof):
+    phones, names = [prof.get("phone")], [prof.get("username")]
+    try:
+        for x in await db.select("ox_owned", {"user_id": f"eq.{prof['id']}", "select": "kind,value", "order": "id"}):
+            (phones if x["kind"] == "phone" else names).append(x["value"])
+    except Exception as e:
+        log.warning("ox_owned: %s", e)
+    for fn, args, field, dst in (("extra_phones_for", {"p_ids": [prof["id"]]}, "phone", phones),
+                                 ("extra_usernames_for", {"p_type": "user", "p_ids": [prof["id"]]}, "username", names)):
+        try:
+            dst += [x[field] for x in (await db.rpc(fn, args) or [])]
+        except Exception:
+            pass
+
+    def uniq(a):
+        seen, out = set(), []
+        for x in a:
+            k = re.sub(r"[\s@+]", "", str(x or "")).lower()
+            if k and k not in seen:
+                seen.add(k); out.append(str(x))
+        return out
+    return uniq(phones), uniq(names)
+
+
+async def build_state(uid: int) -> dict:
+    prof = await get_profile(uid)
+    st = {"ok": True, "is_admin": is_admin(uid), "hidden": CFG["hidden"], "prices": CFG["prices"],
+          "messenger_url": CFG.get("messenger_url", ""), "profile": None, "reg": None}
+    if prof:
+        phones, names = await profile_lists(prof)
+        until = parse_dt(prof.get("premium_until"))
+        active = bool(prof.get("is_premium")) and (not until or until > datetime.now(timezone.utc))
+        st["profile"] = {"name": prof.get("display_name") or "Пользователь Orenix", "phones": phones, "names": names,
+                         "balance": int(float(prof.get("balance") or 0)), "is_premium": active,
+                         "premium_until": prof.get("premium_until")}
+        return st
+    row = await get_pending(uid)
+    if row:
+        region, body = pend_parts(row)
+        code, left, expired = row.get("code"), 0, False
+        if code:
+            issued = CODE_AT.setdefault(uid, time.time())
+            left = max(0, 300 - int(time.time() - issued))
+            if left == 0:
+                code, expired = None, True
+        st["reg"] = {"region": region, "body": body, "entered": bool(row.get("entered_at")),
+                     "code": code, "left": left, "expired": expired}
+    return st
+
+
+async def create_pending(uid: int, code: str):
+    region = "+" + code
+    for _ in range(40):
+        body = gen_digits(10, 3, no_adjacent=True, first="23456789")
+        if await number_taken(region, body):
+            continue
+        try:
+            return (await db.insert(PENDING, {"user_id": uid, "phone": region + body, "code": None,
+                                              "entered_at": None, "notified": False}))[0]
+        except RuntimeError as e:
+            if any(x in str(e).lower() for x in ("409", "duplicate", "unique")):
+                row = await get_pending(uid)
+                if row:
+                    return row
+                continue
+            raise
+    raise ApiError("Не удалось подобрать номер, попробуйте ещё раз")
+
+
+def api_route(fn):
+    async def wrap(request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        user = verify_init(body.get("init", ""))
+        if not user:
+            return web.json_response({"error": "Откройте Mini App из Telegram"}, status=401)
+        uid = user["id"]
+        try:
+            await touch_user(SimpleNamespace(id=uid, username=user.get("username"), first_name=user.get("first_name")))
+            if not is_admin(uid):
+                if uid in BANNED:
+                    return web.json_response({"blocked": "banned", "text": "Вы заблокированы."})
+                if CFG["maintenance"]["on"]:
+                    return web.json_response({"blocked": "maintenance", "text": CFG["maintenance"]["text"]})
+                if not await is_subscribed(uid):
+                    return web.json_response({"blocked": "sub", "link": CHANNEL_LINK})
+            return web.json_response(await fn(uid, user, body))
+        except ApiError as e:
+            return web.json_response({"error": str(e)})
+        except Exception as e:
+            log.error("api %s: %s", fn.__name__, e)
+            return web.json_response({"error": "Ошибка сервера, попробуйте позже"})
+    return wrap
+
+
+@api_route
+async def api_state(uid, user, body):
+    return await build_state(uid)
+
+
+@api_route
+async def api_reg_start(uid, user, body):
+    if await get_profile(uid) or await get_pending(uid):
+        return await build_state(uid)
+    if hidden("get_number") and not is_admin(uid):
+        raise ApiError("Раздел временно недоступен")
+    code = str(body.get("region"))
+    if code not in ("7", "1"):
+        raise ApiError("Неверный регион")
+    await create_pending(uid, code)
+    return await build_state(uid)
+
+
+@api_route
+async def api_reg_code(uid, user, body):
+    row = await get_pending(uid)
+    if not row:
+        raise ApiError("Сначала получите номер")
+    if not row.get("entered_at"):
+        raise ApiError("Сначала введите номер на сайте и нажмите «Далее»")
+    issued = CODE_AT.get(uid)
+    if not row.get("code") or (issued and time.time() - issued > 300):
+        await db.update(PENDING, {"id": row["id"]}, {"code": f"{random.randint(0, 9999):04d}"})
+        CODE_AT[uid] = time.time()
+    return await build_state(uid)
+
+
+@api_route
+async def api_pay(uid, user, body):
+    if not await get_profile(uid):
+        raise ApiError("Сначала зарегистрируйтесь в мессенджере")
+    kind, P = body.get("kind"), CFG["prices"]
+    sect = {"numr": "shop_number", "numc": "shop_number", "usr": "shop_username", "coin": "shop_coins", "prem": "shop_premium"}
+    if kind not in sect:
+        raise ApiError("Неизвестный товар")
+    if not is_admin(uid) and (hidden("shop") or hidden(sect[kind])):
+        raise ApiError("Раздел временно недоступен")
+    if kind in ("numr", "numc"):
+        code = str(body.get("code", "")).strip().lstrip("+")
+        if not valid_code(code):
+            raise ApiError("Введите код региона цифрами, например 7")
+        price = P["num_rand"] if kind == "numr" else P["num_custom"]
+        if price is None:
+            raise ApiError("Цена пока не установлена")
+        if kind == "numr":
+            for _ in range(60):
+                d = gen_digits(4, 2)
+                if await item_free("phone", label_of(code, d)):
+                    break
+            else:
+                raise ApiError("Свободных номеров не нашлось, попробуйте другой регион")
+        else:
+            d = str(body.get("digits", "")).strip()
+            if not re.fullmatch(r"\d{4}", d):
+                raise ApiError("Нужно ровно 4 цифры")
+            if not await item_free("phone", label_of(code, d)):
+                raise ApiError(f"Номер {label_of(code, d)} занят")
+        title, payload = f"Номер {label_of(code, d)}", f"{kind}:{code}:{d}"
+    elif kind == "usr":
+        name = str(body.get("name", "")).strip().lstrip("@")
+        if not re.fullmatch(r"[A-Za-z0-9_]{4,10}", name):
+            raise ApiError("Юзернейм: 4–10 символов, латиница, цифры и _")
+        price = P["username"]
+        if price is None:
+            raise ApiError("Цена пока не установлена")
+        if not await item_free("username", name):
+            raise ApiError(f"@{name} занят")
+        title, payload = f"Юзернейм @{name}", f"usr:{name}"
+    elif kind == "coin":
+        pack = P["coins"][int(body.get("idx", -1))]
+        price, title, payload = pack["stars"], f"{pack['coins']} Cat Coin", f"coin:{int(body['idx'])}:{pack['coins']}"
+    else:
+        days = str(body.get("days"))
+        price, title, payload = P["premium"].get(days), f"Orenix Premium · {days} дн", f"prem:{days}"
+    if price is None:
+        raise ApiError("Цена пока не установлена")
+    link = await bot.create_invoice_link(title=title[:32], description=f"{title} — зачислится сразу после оплаты"[:255],
+                                         payload=payload, currency="XTR", provider_token="",
+                                         prices=[LabeledPrice(label=title[:32], amount=int(price))])
+    return {"ok": True, "link": link}
+
+
+@api_route
+async def api_support(uid, user, body):
+    text = str(body.get("text", "")).strip()[:2000]
+    if len(text) < 3:
+        raise ApiError("Напишите сообщение")
+    tickets = await db.select("ox_tickets", {"tg_id": f"eq.{uid}", "status": "eq.open", "limit": "1"})
+    name = (user.get("first_name", "") + " " + user.get("last_name", "")).strip() or str(uid)
+    t = tickets[0] if tickets else (await db.insert("ox_tickets", {"tg_id": uid, "name": name}))[0]
+    await db.insert("ox_ticket_msgs", {"ticket_id": t["id"], "from_admin": False, "body": text})
+    await db.update("ox_tickets", {"id": t["id"]}, {"updated_at": datetime.now(timezone.utc).isoformat()})
+    msg = (f"📩 <b>Обращение #{t['id']}</b> (Mini App)\nОт: {esc(name)} {('@' + user['username']) if user.get('username') else ''} "
+           f"(<code>{uid}</code>)\n\n{esc(text)}")
+    markup = kb([B("✍️ Ответить", f"tk:r:{t['id']}"), B("✅ Закрыть", f"tk:c:{t['id']}")])
+    for aid in MAIN_ADMINS | DB_ADMINS:
+        try:
+            await bot.send_message(aid, msg, reply_markup=markup)
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+async def serve_app(_):
+    try:
+        with open(APP_FILE, encoding="utf-8") as f:
+            return web.Response(text=f.read(), content_type="text/html", headers={"Cache-Control": "no-store"})
+    except FileNotFoundError:
+        return web.Response(status=404, text="miniapp.html не найден рядом с bot.py")
+
+
 async def health(_):
     return web.Response(text="ok")
 
@@ -1347,11 +1591,21 @@ async def main():
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    app.router.add_get("/app", serve_app)
+    for name, fn in (("state", api_state), ("reg_start", api_reg_start), ("reg_code", api_reg_code),
+                     ("pay", api_pay), ("support", api_support)):
+        app.router.add_post(f"/api/{name}", fn)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
 
     asyncio.create_task(watcher())
+    if APP_URL:
+        try:
+            await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Orenix", web_app=WebAppInfo(url=APP_URL)))
+        except Exception as e:
+            log.warning("menu button: %s", e)
+        log.info("Mini App: %s", APP_URL)
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("Orenix bot started")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
