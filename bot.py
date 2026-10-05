@@ -89,6 +89,7 @@ DEFAULT_CFG = {
     "maintenance": {"on": False, "text": "🛠 В боте идут технические работы. Скоро вернёмся!"},
     "hidden": {},
     "messenger_url": "",
+    "old": {},  # прежние цены для показа скидки
     "links": {},  # tg_id -> id профиля на сайте (ручная привязка существующих аккаунтов)
     "prices": {
         "num_rand": None, "num_custom": None, "username": None,
@@ -136,6 +137,40 @@ async def load_cfg():
 
 async def save_cfg():
     await db.insert("ox_settings", {"key": CFG_KEY, "value": CFG}, upsert=True, conflict="key")
+
+
+def set_price(key: str, new):
+    """Меняет цену и ведёт «старую цену»: если новая ниже — в мини-аппе покажется скидка."""
+    P, old = CFG["prices"], CFG.setdefault("old", {})
+    if key.startswith("prem:"):
+        cur, okey = P["premium"].get(key[5:]), key
+    elif key.startswith("coin:"):
+        pack = P["coins"][int(key[5:])]
+        cur, okey = pack["stars"], f"coin:{pack['coins']}"
+    else:
+        cur, okey = P.get(key), key
+    base = old.get(okey) or cur
+    if new is not None and base is not None and new < base:
+        old[okey] = base
+    else:
+        old.pop(okey, None)
+    if key.startswith("prem:"):
+        P["premium"][key[5:]] = new
+    elif key.startswith("coin:"):
+        pack["stars"] = new
+    else:
+        P[key] = new
+
+
+def add_pack(coins: int, stars):
+    if not 1 <= coins <= 100_000_000:
+        raise ValueError("Количество кк: от 1 до 100 000 000")
+    if any(p["coins"] == coins for p in CFG["prices"]["coins"]):
+        raise ValueError("Такой пак уже есть")
+    if stars is not None and not 1 <= stars <= 100000:
+        raise ValueError("Цена: от 1 до 100000 или прочерк")
+    CFG["prices"]["coins"].append({"coins": coins, "stars": stars})
+    CFG["prices"]["coins"].sort(key=lambda p: p["coins"])
 
 
 def is_admin(uid: int) -> bool:
@@ -373,7 +408,7 @@ class S(StatesGroup):
     rand_region = State(); cust_region = State(); cust_digits = State(); username = State(); support = State()
     adm_reply = State(); adm_price = State(); adm_ban = State(); adm_unban = State()
     adm_addadm = State(); adm_rmadm = State(); adm_mt_text = State(); adm_bc = State(); adm_link = State()
-    adm_lnk_add = State(); adm_lnk_del = State()
+    adm_lnk_add = State(); adm_lnk_del = State(); adm_coinadd = State()
 
 
 CANCEL = kb([B("✖️ Отмена", "m:main")])
@@ -905,6 +940,7 @@ def prices_kb():
         rows.append([B(f"💎 Premium {d} дн: {ps(v)}", f"pr:prem:{d}")])
     for i, cpk in enumerate(p["coins"]):
         rows.append([B(f"🪙 {cpk['coins']} кк: {ps(cpk['stars'])}", f"pr:coin:{i}")])
+    rows.append([B("➕ Новый пак кк", "pc:add")])
     rows.append([B("← Админ-панель", "ad:main")])
     return kb(*rows)
 
@@ -925,6 +961,28 @@ async def pr_edit(c: CallbackQuery, state: FSMContext):
                kb([B("✖️ Отмена", "ad:prices")]))
 
 
+@ar.callback_query(F.data == "pc:add")
+async def pc_add(c: CallbackQuery, state: FSMContext):
+    await state.set_state(S.adm_coinadd)
+    await c.answer()
+    await show(c, "Отправьте количество кк и цену в ⭐ через пробел.\n\n<code>3000 30</code> — пак 3000 кк за 30 ⭐\n"
+                  "<code>3000</code> — цена по курсу (1 ⭐ = 100 кк)\n<code>3000 -</code> — без цены (прочерк)", kb([B("✖️ Отмена", "ad:prices")]))
+
+
+@ar.message(S.adm_coinadd, F.text)
+async def pc_add_do(m: Message, state: FSMContext):
+    parts = m.text.split()
+    try:
+        coins = int(parts[0])
+        stars = None if len(parts) > 1 and parts[1] in ("-", "—") else (int(parts[1]) if len(parts) > 1 else (coins // 100 or None))
+        add_pack(coins, stars)
+    except (ValueError, IndexError) as e:
+        return await m.answer(str(e) if isinstance(e, ValueError) and not str(e).startswith("invalid") else "Формат: <code>3000 30</code>")
+    await save_cfg()
+    await state.clear()
+    await m.answer("✅ Пак добавлен", reply_markup=prices_kb())
+
+
 @ar.message(S.adm_price, F.text)
 async def pr_set(m: Message, state: FSMContext):
     t = m.text.strip()
@@ -935,13 +993,7 @@ async def pr_set(m: Message, state: FSMContext):
     else:
         return await m.answer("Введите число от 1 до 100000 или «-».")
     key = (await state.get_data())["key"]
-    p = CFG["prices"]
-    if key.startswith("prem:"):
-        p["premium"][key[5:]] = val
-    elif key.startswith("coin:"):
-        p["coins"][int(key[5:])]["stars"] = val
-    else:
-        p[key] = val
+    set_price(key, val)
     await save_cfg()
     await state.clear()
     await m.answer("✅ Сохранено", reply_markup=prices_kb())
@@ -1383,7 +1435,7 @@ async def profile_lists(prof):
 async def build_state(uid: int) -> dict:
     prof = await get_profile(uid)
     st = {"ok": True, "is_admin": is_admin(uid), "hidden": CFG["hidden"], "prices": CFG["prices"],
-          "messenger_url": CFG.get("messenger_url", ""), "profile": None, "reg": None}
+          "messenger_url": CFG.get("messenger_url", ""), "profile": None, "reg": None, "old": CFG.get("old", {})}
     if prof:
         phones, names = await profile_lists(prof)
         until = parse_dt(prof.get("premium_until"))
@@ -1574,7 +1626,7 @@ async def admin_payload(extra=None):
             p = by.get(pid)
             links.append({"tg": tg_id, "label": f"{p['phone']} {p.get('username') or ''}".strip() if p else "профиль не найден"})
     done = [o for o in orders if o["status"] == "granted"]
-    return {"ok": True, "prices": CFG["prices"], "hidden": CFG["hidden"], "admin": {
+    return {"ok": True, "prices": CFG["prices"], "hidden": CFG["hidden"], "old": CFG.get("old", {}), "admin": {
         "maintenance": CFG["maintenance"], "messenger_url": CFG.get("messenger_url", ""),
         "stats": {"users": len(users), "banned": len(BANNED), "orders": len(done),
                   "stars": sum(o["stars"] or 0 for o in done), "tickets": len(tickets)},
@@ -1602,14 +1654,21 @@ async def api_admin(uid, user, body):
             v = int(v)
             if not 1 <= v <= 100000:
                 raise ApiError("Цена: от 1 до 100000 или прочерк")
-        if key.startswith("prem:") and key[5:] in P["premium"]:
-            P["premium"][key[5:]] = v
-        elif key.startswith("coin:"):
-            P["coins"][int(key[5:])]["stars"] = v
-        elif key in ("num_rand", "num_custom", "username"):
-            P[key] = v
-        else:
+        if not ((key.startswith("prem:") and key[5:] in P["premium"]) or key.startswith("coin:")
+                or key in ("num_rand", "num_custom", "username")):
             raise ApiError("Неизвестная цена")
+        set_price(key, v)
+        await save_cfg()
+    elif op == "coin_add":
+        try:
+            raw = body.get("stars")
+            add_pack(int(body.get("coins")), None if raw in (None, "") else int(raw))
+        except (ValueError, TypeError) as e:
+            raise ApiError(str(e) if "кк" in str(e) or "пак" in str(e) or "Цена" in str(e) else "Введите числа")
+        await save_cfg()
+    elif op == "coin_del":
+        pack = P["coins"].pop(int(body.get("idx")))
+        CFG.setdefault("old", {}).pop(f"coin:{pack['coins']}", None)
         await save_cfg()
     elif op == "hide":
         if body.get("key") not in SECTIONS:
