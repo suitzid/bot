@@ -1386,6 +1386,8 @@ async def check_schema():
 
 
 # ───────────────────────── Mini App API ─────────────────────────
+SUPPORT_AT: dict = {}
+BG_TASKS: set = set()
 APP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp.html")
 
 
@@ -1579,8 +1581,11 @@ async def api_pay(uid, user, body):
             raise ApiError(f"@{name} занят")
         title, payload = f"Юзернейм @{name}", f"usr:{name}"
     elif kind == "coin":
-        pack = P["coins"][int(body.get("idx", -1))]
-        price, title, payload = pack["stars"], f"{pack['coins']} Cat Coin", f"coin:{int(body['idx'])}:{pack['coins']}"
+        idx = int(body.get("idx", -1))
+        if not 0 <= idx < len(P["coins"]):
+            raise ApiError("Пак не найден")
+        pack = P["coins"][idx]
+        price, title, payload = pack["stars"], f"{pack['coins']} Cat Coin", f"coin:{idx}:{pack['coins']}"
     else:
         days = str(body.get("days"))
         price, title, payload = P["premium"].get(days), f"Orenix Premium · {days} дн", f"prem:{days}"
@@ -1597,6 +1602,9 @@ async def api_support(uid, user, body):
     text = str(body.get("text", "")).strip()[:2000]
     if len(text) < 3:
         raise ApiError("Напишите сообщение")
+    if time.time() - SUPPORT_AT.get(uid, 0) < 20:
+        raise ApiError("Подождите немного перед следующим обращением")
+    SUPPORT_AT[uid] = time.time()
     tickets = await db.select("ox_tickets", {"tg_id": f"eq.{uid}", "status": "eq.open", "limit": "1"})
     name = (user.get("first_name", "") + " " + user.get("last_name", "")).strip() or str(uid)
     t = tickets[0] if tickets else (await db.insert("ox_tickets", {"tg_id": uid, "name": name}))[0]
@@ -1734,7 +1742,9 @@ async def api_admin(uid, user, body):
         text = str(body.get("text", "")).strip()[:3500]
         if len(text) < 2:
             raise ApiError("Введите текст")
-        asyncio.create_task(broadcast(text))
+        t = asyncio.create_task(broadcast(text))
+        BG_TASKS.add(t)
+        t.add_done_callback(BG_TASKS.discard)
     elif op != "get":
         raise ApiError("Неизвестная операция")
     return await admin_payload()
