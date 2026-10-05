@@ -1387,6 +1387,32 @@ async def check_schema():
 
 # ───────────────────────── Mini App API ─────────────────────────
 SUPPORT_AT: dict = {}
+SITE = {"t": 0.0, "v": {}}
+
+
+async def site_settings() -> dict:
+    """Настройки из админки сайта (вкладка Mini App): реклама, ссылка на мессенджер. Кэш 10 с."""
+    if time.time() - SITE["t"] < 10:
+        return SITE["v"]
+    SITE["t"] = time.time()
+    try:
+        data = await db.rpc("mini_settings_all")
+        SITE["v"] = data if isinstance(data, dict) else {}
+    except Exception as e:
+        log.warning("mini_settings_all: %s", e)
+    return SITE["v"]
+
+
+def ad_view(site: dict):
+    ad = site.get("ad") or {}
+    text = str(ad.get("text") or "").strip()
+    if ad.get("enabled") is False or not text:
+        return None
+    return {"label": ad.get("label") or "Реклама", "advertiser": ad.get("advertiser") or "", "text": text,
+            "link": ad.get("link") or "", "whatText": ad.get("whatText") or "", "whatBody": ad.get("whatBody") or "",
+            "closable": ad.get("closable") is not False, "version": ad.get("version") or 1}
+
+
 BG_TASKS: set = set()
 APP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp.html")
 
@@ -1436,8 +1462,9 @@ async def profile_lists(prof):
 
 async def build_state(uid: int) -> dict:
     prof = await get_profile(uid)
-    st = {"ok": True, "is_admin": is_admin(uid), "hidden": CFG["hidden"], "prices": CFG["prices"],
-          "messenger_url": CFG.get("messenger_url", ""), "profile": None, "reg": None, "old": CFG.get("old", {})}
+    site = await site_settings()
+    st = {"ok": True, "is_admin": is_admin(uid), "hidden": CFG["hidden"], "prices": CFG["prices"], "ad": ad_view(site),
+          "messenger_url": (site.get("general") or {}).get("messengerUrl") or CFG.get("messenger_url", ""), "profile": None, "reg": None, "old": CFG.get("old", {})}
     if prof:
         phones, names = await profile_lists(prof)
         until = parse_dt(prof.get("premium_until"))
@@ -1758,6 +1785,20 @@ async def serve_app(_):
         return web.Response(status=404, text="miniapp.html не найден рядом с bot.py")
 
 
+async def sync_loop():
+    """Подтягивает изменения, сделанные в админке сайта."""
+    while True:
+        await asyncio.sleep(10)
+        try:
+            await load_cfg()
+            admins = {x["tg_id"] for x in await db.select("ox_admins", {"select": "tg_id"})}
+            banned = {x["tg_id"] for x in await db.select("ox_users", {"banned": "eq.true", "select": "tg_id"})}
+            DB_ADMINS.clear(); DB_ADMINS.update(admins)
+            BANNED.clear(); BANNED.update(banned)
+        except Exception as e:
+            log.warning("sync: %s", e)
+
+
 async def health(_):
     return web.Response(text="ok")
 
@@ -1790,6 +1831,7 @@ async def main():
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
 
     asyncio.create_task(watcher())
+    asyncio.create_task(sync_loop())
     if APP_URL:
         try:
             await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Orenix", web_app=WebAppInfo(url=APP_URL)))
