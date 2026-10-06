@@ -1670,12 +1670,20 @@ async def admin_payload(extra=None):
 
 async def broadcast(text: str):
     users = await db.select("ox_users", {"banned": "eq.false", "select": "tg_id", "limit": "100000"})
+    sent = 0
     for u in users:
         try:
             await bot.send_message(u["tg_id"], esc(text))
+            sent += 1
         except Exception:
             pass
         await asyncio.sleep(0.05)
+    return sent, len(users)
+
+
+async def run_site_broadcast(row):
+    sent, total = await broadcast(row["text"])
+    await db.update("ox_broadcasts", {"id": row["id"]}, {"status": "done", "sent": sent, "total": total})
 
 
 @api_route
@@ -1797,6 +1805,14 @@ async def sync_loop():
             BANNED.clear(); BANNED.update(banned)
         except Exception as e:
             log.warning("sync: %s", e)
+        try:  # рассылки, поставленные в очередь из админки сайта
+            for row in await db.select("ox_broadcasts", {"status": "eq.pending", "order": "id.asc", "limit": "1"}):
+                await db.update("ox_broadcasts", {"id": row["id"]}, {"status": "sending"})
+                t = asyncio.create_task(run_site_broadcast(row))
+                BG_TASKS.add(t)
+                t.add_done_callback(BG_TASKS.discard)
+        except Exception as e:
+            log.debug("broadcasts: %s", e)
 
 
 async def health(_):
