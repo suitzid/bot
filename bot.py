@@ -29,12 +29,12 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton as Btn, InlineKey
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orenix")
-logging.getLogger("httpx").setLevel(logging.WARNING)  # не засорять логи запросами к базе
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ───────────────────────── настройки (env) ─────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://plysapfztvihxkioxtch.supabase.co").rstrip("/")
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]  # secret / service_role ключ
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 MAIN_ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "5570425300").replace(" ", "").split(",") if x}
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1004491870504"))
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/+2QGm_H2UchgwNDJi")
@@ -42,7 +42,7 @@ WEB_ADMIN_EMAIL = os.getenv("WEB_ADMIN_EMAIL", "")
 WEB_ADMIN_PASSWORD = os.getenv("WEB_ADMIN_PASSWORD", "")
 PORT = int(os.getenv("PORT", "10000"))
 _ext = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-APP_URL = os.getenv("MINIAPP_URL") or (_ext + "/app" if _ext else "")  # мини-апп отдаётся самим ботом
+APP_URL = os.getenv("MINIAPP_URL") or (_ext + "/app" if _ext else "")
 
 esc = html.escape
 
@@ -89,8 +89,8 @@ DEFAULT_CFG = {
     "maintenance": {"on": False, "text": "🛠 В боте идут технические работы. Скоро вернёмся!"},
     "hidden": {},
     "messenger_url": "",
-    "old": {},  # прежние цены для показа скидки
-    "links": {},  # tg_id -> id профиля на сайте (ручная привязка существующих аккаунтов)
+    "old": {},
+    "links": {},
     "prices": {
         "num_rand": None, "num_custom": None, "username": None,
         "premium": {"7": 45, "30": 100, "90": 180, "180": 250, "360": 400},
@@ -115,13 +115,13 @@ def deep_merge(base, extra):
     return out
 
 
-CFG_KEY = "orenix_config"  # свой ключ, чтобы не пересекаться со старыми записями в ox_settings
+CFG_KEY = "orenix_config"
 
 
 async def load_cfg():
     rows = await db.select("ox_settings", {"key": f"eq.{CFG_KEY}"})
     saved = rows[0]["value"] if rows else {}
-    if isinstance(saved, str):  # если колонка value текстовая
+    if isinstance(saved, str):
         try:
             saved = json.loads(saved)
         except Exception:
@@ -130,7 +130,6 @@ async def load_cfg():
         saved = {}
     CFG.clear()
     CFG.update(deep_merge(DEFAULT_CFG, saved))
-    # списки не мёрджим — берём сохранённые целиком
     if isinstance(saved.get("prices", {}).get("coins"), list):
         CFG["prices"]["coins"] = saved["prices"]["coins"]
 
@@ -140,7 +139,6 @@ async def save_cfg():
 
 
 def set_price(key: str, new):
-    """Меняет цену и ведёт «старую цену»: если новая ниже — в мини-аппе покажется скидка."""
     P, old = CFG["prices"], CFG.setdefault("old", {})
     if key.startswith("prem:"):
         cur, okey = P["premium"].get(key[5:]), key
@@ -195,7 +193,6 @@ def kb(*rows):
 
 
 def vb(key, uid, text, cb):
-    """Кнопка с учётом скрытия: у обычных пользователей пропадает, у админов получает 🔒."""
     if hidden(key):
         return B("🔒 " + text, cb) if is_admin(uid) else None
     return B(text, cb)
@@ -205,7 +202,7 @@ def tg_name(u) -> str:
     return f"@{u.username}" if u.username else (u.first_name or str(u.id))
 
 
-def grouped(n: str) -> str:  # как formatNumberGrouped в мессенджере
+def grouped(n: str) -> str:
     if len(n) <= 3:
         return n
     parts, rest = [n[:3]], n[3:]
@@ -293,10 +290,11 @@ def sub_kb():
 SUB_TEXT = "Для использования бота подпишись на наш канал, затем нажми «Я подписался»."
 
 
-PENDING = "orenix_pending"   # та же таблица, что читает сайт (id, user_id, phone, code, entered_at, notified, approval)
+PENDING = "orenix_pending"
 PROFILE_FIELDS = "id,phone,username,display_name,avatar_url,balance,is_premium,premium_until,is_deleted"
-CODE_AT: dict = {}   # tg_id -> время выдачи кода
-REG_MSG: dict = {}   # tg_id -> (chat_id, message_id) экрана с номером
+CODE_AT: dict = {}          # tg_id -> время выдачи кода
+REG_MSG: dict = {}          # tg_id -> (chat_id, message_id) экрана с номером
+APPROVAL_MSGS: dict = {}    # pid -> {"text": исходный текст запроса, "msgs": [(chat_id, message_id), ...]}
 
 
 async def get_pending(uid: int):
@@ -305,11 +303,11 @@ async def get_pending(uid: int):
 
 
 def pend_parts(row):
-    phone = row["phone"]  # '+7' + 10 цифр
+    phone = row["phone"]
     return phone[:2], phone[2:]
 
 
-def pend_label(row) -> str:  # как сайт пишет номер в profiles.phone: '+7 912 345 678 9'
+def pend_label(row) -> str:
     region, body = pend_parts(row)
     return f"{region} {grouped(body)}"
 
@@ -321,10 +319,9 @@ def pend_state(row) -> str:
 
 
 async def get_profile(tg_id: int):
-    """Есть заявка на номер от этого tg-аккаунта И на сайте уже создан профиль с этим номером."""
     try:
         pid = CFG.get("links", {}).get(str(tg_id))
-        if pid:  # аккаунт привязан вручную через админ-панель
+        if pid:
             r = await db.select("profiles", {"id": f"eq.{pid}", "limit": "1", "select": PROFILE_FIELDS})
             if r:
                 return r[0]
@@ -347,14 +344,14 @@ async def number_taken(region: str, body: str) -> bool:
     return not await item_free("phone", label)
 
 
-# ───────────────────────── middleware: бан / тех.работы / подписка ─────────────────────────
+# ───────────────────────── middleware ─────────────────────────
 class Gate(BaseMiddleware):
     async def __call__(self, handler, event, data):
         u = data.get("event_from_user")
         if not u or u.is_bot:
             return await handler(event, data)
         if isinstance(event, Message) and event.successful_payment:
-            return await handler(event, data)  # оплаченное выдаём всегда
+            return await handler(event, data)
         await touch_user(u)
         if is_admin(u.id):
             return await handler(event, data)
@@ -406,7 +403,7 @@ async def guard(c: CallbackQuery, *keys) -> bool:
     return True
 
 
-sr = Router()  # /start — первым, чтобы сбрасывал любые состояния
+sr = Router()
 r = Router()
 
 
@@ -455,13 +452,13 @@ async def account_entry(c: CallbackQuery):
     if prof:
         return await show_profile(c, prof)
     row = await get_pending(uid)
-    if row:  # заявка уже есть — показываем по её статусу
+    if row:
         REG_MSG[uid] = (c.message.chat.id, c.message.message_id)
         st = pend_state(row)
         if st == "pending":
             return await show(c, wait_text(), wait_kb())
         if st == "denied":
-            return await show(c, denied_text(), wait_kb())
+            return await show(c, denied_text(), denied_kb())
         return await show(c, reg_text(row), reg_kb(row))
     await show(c, "🌍 <b>Выберите регион номера:</b>",
                kb([B("🇷🇺 +7", "reg:7"), B("🇺🇸 +1", "reg:1")], [B("← Меню", "m:main")]))
@@ -525,7 +522,7 @@ def reg_kb(row):
               [B("← Меню", "m:main")])
 
 
-# ── модульная выдача номера ────────────────────────────────────────
+# ── выдача номера с модерацией ─────────────────────────────────────
 def wait_text() -> str:
     return ("⏳ <b>Запрос отправлен на проверку</b>\n\n"
             "Ваш запрос на получение номера ожидает одобрения администратора. "
@@ -538,7 +535,12 @@ def wait_kb():
 
 def denied_text() -> str:
     return ("❌ <b>Запрос отклонён</b>\n\n"
-            "Администратор отклонил выдачу номера. Если считаете это ошибкой — напишите в поддержку.")
+            "Администратор отклонил выдачу номера. Если считаете это ошибкой — напишите в поддержку "
+            "или попробуйте запросить номер заново.")
+
+
+def denied_kb():
+    return kb([B("🔄 Попробовать снова", "gn:retry")], [B("← Меню", "m:main")])
 
 
 async def notify_admins_approval(row, uid: int, name: str):
@@ -550,11 +552,41 @@ async def notify_admins_approval(row, uid: int, name: str):
         [B("✅ Разрешить", f"ap:ok:{row['id']}"), B("❌ Запретить", f"ap:no:{row['id']}")],
         [B("🚫 Забанить", f"ap:ban:{row['id']}")],
     )
+    sent = []
     for aid in MAIN_ADMINS | DB_ADMINS:
         try:
-            await bot.send_message(aid, text, reply_markup=markup)
+            m = await bot.send_message(aid, text, reply_markup=markup)
+            sent.append((m.chat.id, m.message_id))
         except Exception:
             pass
+    if sent:
+        APPROVAL_MSGS[row["id"]] = {"text": text, "msgs": sent}
+
+
+async def edit_approval_msgs(pid: int, suffix: str):
+    """Дописывает результат к сообщению-запросу у всех админов и убирает кнопки."""
+    data = APPROVAL_MSGS.pop(pid, None)
+    if not data:
+        return
+    new_text = data["text"] + "\n\n" + suffix
+    for (cid, mid) in data["msgs"]:
+        try:
+            await bot.edit_message_text(new_text, chat_id=cid, message_id=mid, reply_markup=None)
+        except Exception:
+            pass
+
+
+@r.callback_query(F.data == "gn:retry")
+async def gn_retry(c: CallbackQuery):
+    if not await guard(c, "get_number"):
+        return
+    uid = c.from_user.id
+    row = await get_pending(uid)
+    if row and pend_state(row) == "denied":
+        await db.delete(PENDING, {"id": row["id"]})
+    await c.answer()
+    await show(c, "🌍 <b>Выберите регион номера:</b>",
+               kb([B("🇷🇺 +7", "reg:7"), B("🇺🇸 +1", "reg:1")], [B("← Меню", "m:main")]))
 
 
 @r.callback_query(F.data.startswith("reg:"))
@@ -565,16 +597,20 @@ async def reg_number(c: CallbackQuery):
     if await get_profile(uid):
         await c.answer()
         return await show(c, "У вас уже есть аккаунт 👍", kb([B("👤 Профиль", "pf")]))
-    row = await get_pending(uid)  # один номер на аккаунт — как в рабочей версии
+    row = await get_pending(uid)
     if row:
-        REG_MSG[uid] = (c.message.chat.id, c.message.message_id)
         st = pend_state(row)
-        await c.answer()
         if st == "pending":
+            REG_MSG[uid] = (c.message.chat.id, c.message.message_id)
+            await c.answer()
             return await show(c, wait_text(), wait_kb())
         if st == "denied":
-            return await show(c, denied_text(), wait_kb())
-        return await show(c, reg_text(row), reg_kb(row))
+            await db.delete(PENDING, {"id": row["id"]})   # даём попробовать заново
+            row = None
+        else:
+            REG_MSG[uid] = (c.message.chat.id, c.message.message_id)
+            await c.answer()
+            return await show(c, reg_text(row), reg_kb(row))
     code = c.data.split(":")[1]
     if code not in ("7", "1"):
         return await c.answer()
@@ -639,7 +675,7 @@ async def code_get(c: CallbackQuery):
     if not row.get("entered_at"):
         return await c.answer("Сначала введите номер на сайте и нажмите «Далее».", show_alert=True)
     code, issued = row.get("code"), CODE_AT.get(uid)
-    if not code or (issued and time.time() - issued > 300):  # код живёт 5 минут
+    if not code or (issued and time.time() - issued > 300):
         code = f"{random.randint(0, 9999):04d}"
         await db.update(PENDING, {"id": row["id"]}, {"code": code})
         CODE_AT[uid] = issued = time.time()
@@ -655,7 +691,6 @@ async def code_get(c: CallbackQuery):
 
 
 async def watcher():
-    """Как poll_pending в рабочем боте: сайт поставил entered_at -> включаем кнопку «Получить код»."""
     while True:
         try:
             rows = await db.select(PENDING, {"entered_at": "not.is.null", "code": "is.null", "notified": "eq.false",
@@ -844,7 +879,6 @@ async def buy(c: CallbackQuery):
 
 # ───────────────────────── оплата Stars ─────────────────────────
 async def check_payload(payload: str, uid: int):
-    """-> (ok, error, stars). Сверяет цену и доступность с актуальными данными."""
     k, *a = payload.split(":")
     P = CFG["prices"]
     try:
@@ -892,7 +926,7 @@ async def paid(m: Message):
                                        "payload": payload, "stars": stars, "status": "paid"})
     except Exception as e:
         if "409" in str(e) or "duplicate" in str(e).lower():
-            return  # уже обработано
+            return
         log.error("order insert: %s", e)
     prof = await get_profile(uid)
     try:
@@ -1008,6 +1042,7 @@ async def ap_action(c: CallbackQuery):
     if pend_state(row) != "pending":
         return await c.answer("Запрос уже обработан", show_alert=True)
     uid = int(row["user_id"])
+    admin_name = tg_name(c.from_user)
     if act == "ok":
         await db.update(PENDING, {"id": pid}, {"approval": "approved"})
         m = REG_MSG.get(uid)
@@ -1022,14 +1057,14 @@ async def ap_action(c: CallbackQuery):
                 await bot.send_message(uid, "✅ Ваш номер одобрен!", reply_markup=reg_kb(row))
             except Exception:
                 pass
-        status = "✅ Разрешено"
+        suffix = f"✅ <b>Разрешил:</b> {esc(admin_name)}"
     elif act == "no":
         await db.update(PENDING, {"id": pid}, {"approval": "denied"})
         try:
-            await bot.send_message(uid, denied_text(), reply_markup=wait_kb())
+            await bot.send_message(uid, denied_text(), reply_markup=denied_kb())
         except Exception:
             pass
-        status = "❌ Запрещено"
+        suffix = f"❌ <b>Запретил:</b> {esc(admin_name)}"
     elif act == "ban":
         await db.insert("ox_users", {"tg_id": uid, "banned": True}, upsert=True, conflict="tg_id")
         BANNED.add(uid)
@@ -1038,14 +1073,11 @@ async def ap_action(c: CallbackQuery):
             await bot.send_message(uid, "🚫 Вы заблокированы.")
         except Exception:
             pass
-        status = "🚫 Забанен"
+        suffix = f"🚫 <b>Забанил:</b> {esc(admin_name)}"
     else:
         return await c.answer()
-    try:
-        await c.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    await c.answer(status)
+    await edit_approval_msgs(pid, suffix)
+    await c.answer("Готово")
 
 
 # --- цены ---
@@ -1412,7 +1444,7 @@ async def bc_go(c: CallbackQuery, state: FSMContext):
     await c.message.answer(f"✅ Доставлено: {ok} из {len(users)}", reply_markup=BACK_AD)
 
 
-# --- тикеты (ответ админа) ---
+# --- тикеты ---
 @ar.callback_query(F.data.startswith("tk:r:"))
 async def tk_reply(c: CallbackQuery, state: FSMContext):
     await state.set_state(S.adm_reply)
@@ -1452,7 +1484,6 @@ async def tk_close(c: CallbackQuery):
 
 # ───────────────────────── запуск ─────────────────────────
 async def ensure_web_admin():
-    """Создаёт вход в веб-админку (admin.html): почта/пароль из WEB_ADMIN_EMAIL / WEB_ADMIN_PASSWORD."""
     if not (WEB_ADMIN_EMAIL and WEB_ADMIN_PASSWORD):
         return
     try:
@@ -1509,7 +1540,6 @@ SITE = {"t": 0.0, "v": {}}
 
 
 async def site_settings() -> dict:
-    """Настройки из админки сайта (вкладка Mini App): реклама, ссылка на мессенджер. Кэш 10 с."""
     if time.time() - SITE["t"] < 10:
         return SITE["v"]
     SITE["t"] = time.time()
@@ -1540,7 +1570,6 @@ class ApiError(Exception):
 
 
 def verify_init(init: str):
-    """Проверка подписи Telegram WebApp initData. Возвращает dict пользователя или None."""
     try:
         pairs = dict(parse_qsl(init, keep_blank_values=True))
         got = pairs.pop("hash", "")
@@ -1667,8 +1696,17 @@ async def api_state(uid, user, body):
 
 @api_route
 async def api_reg_start(uid, user, body):
-    if await get_profile(uid) or await get_pending(uid):
+    if await get_profile(uid):
         return await build_state(uid)
+    row = await get_pending(uid)
+    if row:
+        st = pend_state(row)
+        if st == "pending":
+            return await build_state(uid)
+        if st == "denied":
+            await db.delete(PENDING, {"id": row["id"]})   # даём попробовать заново
+        else:
+            return await build_state(uid)
     if hidden("get_number") and not is_admin(uid):
         raise ApiError("Раздел временно недоступен")
     code = str(body.get("region"))
@@ -1927,7 +1965,6 @@ async def serve_app(_):
 
 
 async def sync_loop():
-    """Подтягивает изменения, сделанные в админке сайта."""
     while True:
         await asyncio.sleep(10)
         try:
@@ -1938,7 +1975,7 @@ async def sync_loop():
             BANNED.clear(); BANNED.update(banned)
         except Exception as e:
             log.warning("sync: %s", e)
-        try:  # рассылки, поставленные в очередь из админки сайта
+        try:
             for row in await db.select("ox_broadcasts", {"status": "eq.pending", "order": "id.asc", "limit": "1"}):
                 await db.update("ox_broadcasts", {"id": row["id"]}, {"status": "sending"})
                 t = asyncio.create_task(run_site_broadcast(row))
@@ -1965,7 +2002,7 @@ async def main():
     dp.message.outer_middleware(Gate())
     dp.callback_query.outer_middleware(Gate())
     dp.include_router(sr)
-    dp.include_router(ar)   # админ-хендлеры раньше пользовательских
+    dp.include_router(ar)
     dp.include_router(r)
 
     app = web.Application()
