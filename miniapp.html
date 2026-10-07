@@ -150,8 +150,8 @@ function home(){const p=S.profile;
  if(!show('get_number'))return'<div class="mid"><div style="font-size:44px">🔒</div><div>Раздел временно недоступен</div></div>';
  const r=S.reg;
  if(r&&r.state==='pending')return`<h2>⏳ Запрос отправлен</h2><div class="card"><div class="sub">Ожидайте одобрения администратора. Как только запрос подтвердят — номер появится здесь автоматически.</div></div>`;
- if(r&&r.state==='denied')return`<h2>❌ Запрос отклонён</h2><div class="card"><div class="sub">Администратор отклонил выдачу номера. Если считаете это ошибкой — напишите в поддержку.</div></div>`;
- if(!r)return`<h2>${lock('get_number')}Получите номер Orenix</h2><div class="card"><div class="sub">Выберите регион — мы сгенерируем номер для регистрации в мессенджере.</div></div><div class="row"><button class="btn" data-a="reg" data-r="7">🇷🇺 +7</button><button class="btn" data-a="reg" data-r="1">🇺🇸 +1</button></div>`;
+ if(r&&r.state==='denied')return`<h2>❌ Запрос отклонён</h2><div class="card"><div class="sub">Администратор отклонил выдачу номера. Можно попробовать запросить заново — выберите регион.</div></div><div class="row"><button class="btn" data-a="reg" data-r="7">🇷🇺 Попробовать +7</button><button class="btn g" data-a="reg" data-r="1">🇺🇸 +1</button></div>`;
+ if(!r)return`<h2>${lock('get_number')}Получите номер Orenix</h2><div class="card"><div class="sub">Выберите регион — мы сгенерируем номер для регистрации в мессенджере.</div></div><div class="row"><button class="btn" data-a="reg" data-r="7">🇷🇺 +7</button><button class="btn g" data-a="reg" data-r="1">🇺🇸 +1</button></div>`;
  return`<h2>Ваш номер</h2><div class="card main-num" data-a="copy" data-c="${r.body}"><div class="sub">${esc(r.region)}</div><div class="big">${esc(r.body)}</div><div class="sub" style="margin-top:6px">нажмите, чтобы скопировать</div></div>
  <div class="card sub">1. Откройте Orenix Messenger → «Регистрация»<br>2. Введите регион и номер, нажмите «Далее»<br>3. Вернитесь сюда и получите код</div>
  ${r.code&&r.left>0?`<div class="card"><h3>Код подтверждения</h3><div class="code" data-a="copy" data-c="${r.code}">${r.code}</div><div class="sub" style="text-align:center">действует <b id="t">${Math.floor(r.left/60)}:${String(r.left%60).padStart(2,'0')}</b></div></div>`:
@@ -234,4 +234,4 @@ function sbar(){const se=document.scrollingElement,b=$('#sb'),i=b.firstChild,H=s
 addEventListener('scroll',sbar,{passive:true});addEventListener('resize',sbar);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&S&&!S.blocked)load()});
 load(true);
-</script></body></html> 
+</script></body></html>
