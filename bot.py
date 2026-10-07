@@ -293,7 +293,7 @@ def sub_kb():
 SUB_TEXT = "Для использования бота подпишись на наш канал, затем нажми «Я подписался»."
 
 
-PENDING = "orenix_pending"   # та же таблица, что читает сайт (id, user_id, phone, code, entered_at, notified)
+PENDING = "orenix_pending"   # та же таблица, что читает сайт (id, user_id, phone, code, entered_at, notified, approval)
 PROFILE_FIELDS = "id,phone,username,display_name,avatar_url,balance,is_premium,premium_until,is_deleted"
 CODE_AT: dict = {}   # tg_id -> время выдачи кода
 REG_MSG: dict = {}   # tg_id -> (chat_id, message_id) экрана с номером
@@ -312,6 +312,12 @@ def pend_parts(row):
 def pend_label(row) -> str:  # как сайт пишет номер в profiles.phone: '+7 912 345 678 9'
     region, body = pend_parts(row)
     return f"{region} {grouped(body)}"
+
+
+def pend_state(row) -> str:
+    """'pending' | 'approved' | 'denied'. Legacy-строки без колонки считаем одобренными."""
+    v = row.get("approval") if isinstance(row, dict) else None
+    return v if v in ("pending", "approved", "denied") else "approved"
 
 
 async def get_profile(tg_id: int):
@@ -449,8 +455,13 @@ async def account_entry(c: CallbackQuery):
     if prof:
         return await show_profile(c, prof)
     row = await get_pending(uid)
-    if row:  # номер уже выдан, регистрация на сайте ещё не завершена
+    if row:  # заявка уже есть — показываем по её статусу
         REG_MSG[uid] = (c.message.chat.id, c.message.message_id)
+        st = pend_state(row)
+        if st == "pending":
+            return await show(c, wait_text(), wait_kb())
+        if st == "denied":
+            return await show(c, denied_text(), wait_kb())
         return await show(c, reg_text(row), reg_kb(row))
     await show(c, "🌍 <b>Выберите регион номера:</b>",
                kb([B("🇷🇺 +7", "reg:7"), B("🇺🇸 +1", "reg:1")], [B("← Меню", "m:main")]))
@@ -514,6 +525,38 @@ def reg_kb(row):
               [B("← Меню", "m:main")])
 
 
+# ── модульная выдача номера ────────────────────────────────────────
+def wait_text() -> str:
+    return ("⏳ <b>Запрос отправлен на проверку</b>\n\n"
+            "Ваш запрос на получение номера ожидает одобрения администратора. "
+            "Обычно это занимает несколько минут — номер появится здесь автоматически.")
+
+
+def wait_kb():
+    return kb([B("← Меню", "m:main")])
+
+
+def denied_text() -> str:
+    return ("❌ <b>Запрос отклонён</b>\n\n"
+            "Администратор отклонил выдачу номера. Если считаете это ошибкой — напишите в поддержку.")
+
+
+async def notify_admins_approval(row, uid: int, name: str):
+    text = (f"🔔 <b>Новый запрос на номер</b>\n\n"
+            f"👤 {esc(name)} (<code>{uid}</code>)\n"
+            f"📞 <code>{esc(pend_label(row))}</code>\n\n"
+            f"Выдавать номер?")
+    markup = kb(
+        [B("✅ Разрешить", f"ap:ok:{row['id']}"), B("❌ Запретить", f"ap:no:{row['id']}")],
+        [B("🚫 Забанить", f"ap:ban:{row['id']}")],
+    )
+    for aid in MAIN_ADMINS | DB_ADMINS:
+        try:
+            await bot.send_message(aid, text, reply_markup=markup)
+        except Exception:
+            pass
+
+
 @r.callback_query(F.data.startswith("reg:"))
 async def reg_number(c: CallbackQuery):
     if not await guard(c, "get_number"):
@@ -523,31 +566,45 @@ async def reg_number(c: CallbackQuery):
         await c.answer()
         return await show(c, "У вас уже есть аккаунт 👍", kb([B("👤 Профиль", "pf")]))
     row = await get_pending(uid)  # один номер на аккаунт — как в рабочей версии
-    if not row:
-        code = c.data.split(":")[1]
-        if code not in ("7", "1"):
-            return await c.answer()
-        region = "+" + code
-        for _ in range(40):
-            body = gen_digits(10, 3, no_adjacent=True, first="23456789")
-            if await number_taken(region, body):
+    if row:
+        REG_MSG[uid] = (c.message.chat.id, c.message.message_id)
+        st = pend_state(row)
+        await c.answer()
+        if st == "pending":
+            return await show(c, wait_text(), wait_kb())
+        if st == "denied":
+            return await show(c, denied_text(), wait_kb())
+        return await show(c, reg_text(row), reg_kb(row))
+    code = c.data.split(":")[1]
+    if code not in ("7", "1"):
+        return await c.answer()
+    region = "+" + code
+    auto = is_admin(uid)
+    approval = "approved" if auto else "pending"
+    for _ in range(40):
+        body = gen_digits(10, 3, no_adjacent=True, first="23456789")
+        if await number_taken(region, body):
+            continue
+        try:
+            row = (await db.insert(PENDING, {"user_id": uid, "phone": region + body, "code": None,
+                                             "entered_at": None, "notified": False,
+                                             "approval": approval}))[0]
+            break
+        except RuntimeError as e:
+            if any(x in str(e).lower() for x in ("409", "duplicate", "unique")):
+                row = await get_pending(uid)
+                if row:
+                    break
                 continue
-            try:
-                row = (await db.insert(PENDING, {"user_id": uid, "phone": region + body, "code": None,
-                                                 "entered_at": None, "notified": False}))[0]
-                break
-            except RuntimeError as e:
-                if any(x in str(e).lower() for x in ("409", "duplicate", "unique")):
-                    row = await get_pending(uid)
-                    if row:
-                        break
-                    continue
-                raise
-        if not row:
-            return await c.answer("Не удалось подобрать номер, попробуйте ещё раз", show_alert=True)
+            raise
+    if not row:
+        return await c.answer("Не удалось подобрать номер, попробуйте ещё раз", show_alert=True)
     REG_MSG[uid] = (c.message.chat.id, c.message.message_id)
     await c.answer()
-    await show(c, reg_text(row), reg_kb(row))
+    if auto:
+        return await show(c, reg_text(row), reg_kb(row))
+    await notify_admins_approval(row, c.from_user.id, tg_name(c.from_user))
+    await show(c, wait_text(), wait_kb())
 
 
 @r.callback_query(F.data == "code:wait")
@@ -555,6 +612,8 @@ async def code_wait(c: CallbackQuery):
     row = await get_pending(c.from_user.id)
     if not row:
         return await c.answer("Сначала получите номер", show_alert=True)
+    if pend_state(row) != "approved":
+        return await c.answer("Запрос ещё не одобрен администратором", show_alert=True)
     if row.get("entered_at"):
         await c.answer()
         return await show(c, reg_text(row), reg_kb(row))
@@ -575,6 +634,8 @@ async def code_get(c: CallbackQuery):
     row = await get_pending(uid)
     if not row:
         return await c.answer("Сначала получите номер", show_alert=True)
+    if pend_state(row) != "approved":
+        return await c.answer("Запрос ещё не одобрен администратором", show_alert=True)
     if not row.get("entered_at"):
         return await c.answer("Сначала введите номер на сайте и нажмите «Далее».", show_alert=True)
     code, issued = row.get("code"), CODE_AT.get(uid)
@@ -600,6 +661,8 @@ async def watcher():
             rows = await db.select(PENDING, {"entered_at": "not.is.null", "code": "is.null", "notified": "eq.false",
                                              "order": "id.asc", "limit": "50"})
             for row in rows:
+                if pend_state(row) != "approved":
+                    continue
                 await db.update(PENDING, {"id": row["id"]}, {"notified": True})
                 uid = int(row["user_id"])
                 m = REG_MSG.get(uid)
@@ -928,6 +991,61 @@ async def ad_main(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await c.answer()
     await show(c, "⚙️ <b>Админ-панель</b>", admin_kb())
+
+
+# --- модерация заявок на номер ---
+@ar.callback_query(F.data.startswith("ap:"))
+async def ap_action(c: CallbackQuery):
+    try:
+        _, act, sid = c.data.split(":")
+        pid = int(sid)
+    except Exception:
+        return await c.answer()
+    rows = await db.select(PENDING, {"id": f"eq.{pid}", "limit": "1"})
+    if not rows:
+        return await c.answer("Запрос не найден", show_alert=True)
+    row = rows[0]
+    if pend_state(row) != "pending":
+        return await c.answer("Запрос уже обработан", show_alert=True)
+    uid = int(row["user_id"])
+    if act == "ok":
+        await db.update(PENDING, {"id": pid}, {"approval": "approved"})
+        m = REG_MSG.get(uid)
+        try:
+            if m:
+                await bot.edit_message_text(reg_text(row), chat_id=m[0], message_id=m[1], reply_markup=reg_kb(row))
+            else:
+                await bot.send_message(uid, "✅ Номер одобрен!\n\n" + reg_text(row), reply_markup=reg_kb(row))
+        except Exception as e:
+            log.warning("approve notify %s: %s", uid, e)
+            try:
+                await bot.send_message(uid, "✅ Ваш номер одобрен!", reply_markup=reg_kb(row))
+            except Exception:
+                pass
+        status = "✅ Разрешено"
+    elif act == "no":
+        await db.update(PENDING, {"id": pid}, {"approval": "denied"})
+        try:
+            await bot.send_message(uid, denied_text(), reply_markup=wait_kb())
+        except Exception:
+            pass
+        status = "❌ Запрещено"
+    elif act == "ban":
+        await db.insert("ox_users", {"tg_id": uid, "banned": True}, upsert=True, conflict="tg_id")
+        BANNED.add(uid)
+        await db.update(PENDING, {"id": pid}, {"approval": "denied"})
+        try:
+            await bot.send_message(uid, "🚫 Вы заблокированы.")
+        except Exception:
+            pass
+        status = "🚫 Забанен"
+    else:
+        return await c.answer()
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await c.answer(status)
 
 
 # --- цены ---
@@ -1358,7 +1476,7 @@ async def ensure_web_admin():
 
 SCHEMA = {
     "ox_users": "tg_id,username,first_name,banned,last_seen", "ox_settings": "key,value", "ox_admins": "tg_id,added_by",
-    "orenix_pending": "id,user_id,phone,code,entered_at,notified",
+    "orenix_pending": "id,user_id,phone,code,entered_at,notified,approval",
     "ox_owned": "id,user_id,tg_id,kind,value,stars", "ox_orders": "id,charge_id,tg_id,kind,payload,stars,status,error",
     "ox_tickets": "id,tg_id,name,status,updated_at", "ox_ticket_msgs": "id,ticket_id,from_admin,admin_id,body",
 }
@@ -1380,7 +1498,7 @@ async def check_schema():
     except Exception as e:
         bad.append(f"ox_item_free: {str(e)[:160]}")
     if bad:
-        log.error("СХЕМА БД НЕ ГОТОВА (запустите SQL-части 1-4):\n%s", "\n".join(bad))
+        log.error("СХЕМА БД НЕ ГОТОВА (запустите SQL-части 1-4, включая ALTER TABLE orenix_pending ADD COLUMN approval):\n%s", "\n".join(bad))
     else:
         log.info("Схема БД проверена: всё на месте")
 
@@ -1475,6 +1593,13 @@ async def build_state(uid: int) -> dict:
         return st
     row = await get_pending(uid)
     if row:
+        st_state = pend_state(row)
+        if st_state == "pending":
+            st["reg"] = {"state": "pending"}
+            return st
+        if st_state == "denied":
+            st["reg"] = {"state": "denied"}
+            return st
         region, body = pend_parts(row)
         code, left, expired = row.get("code"), 0, False
         if code:
@@ -1487,7 +1612,7 @@ async def build_state(uid: int) -> dict:
     return st
 
 
-async def create_pending(uid: int, code: str):
+async def create_pending(uid: int, code: str, approval: str = "pending"):
     region = "+" + code
     for _ in range(40):
         body = gen_digits(10, 3, no_adjacent=True, first="23456789")
@@ -1495,7 +1620,8 @@ async def create_pending(uid: int, code: str):
             continue
         try:
             return (await db.insert(PENDING, {"user_id": uid, "phone": region + body, "code": None,
-                                              "entered_at": None, "notified": False}))[0]
+                                              "entered_at": None, "notified": False,
+                                              "approval": approval}))[0]
         except RuntimeError as e:
             if any(x in str(e).lower() for x in ("409", "duplicate", "unique")):
                 row = await get_pending(uid)
@@ -1548,7 +1674,12 @@ async def api_reg_start(uid, user, body):
     code = str(body.get("region"))
     if code not in ("7", "1"):
         raise ApiError("Неверный регион")
-    await create_pending(uid, code)
+    auto = is_admin(uid)
+    row = await create_pending(uid, code, "approved" if auto else "pending")
+    if not auto:
+        nm = f"@{user['username']}" if user.get("username") else (
+            ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip() or str(uid))
+        await notify_admins_approval(row, uid, nm)
     return await build_state(uid)
 
 
@@ -1557,6 +1688,8 @@ async def api_reg_code(uid, user, body):
     row = await get_pending(uid)
     if not row:
         raise ApiError("Сначала получите номер")
+    if pend_state(row) != "approved":
+        raise ApiError("Запрос ещё не одобрен администратором")
     if not row.get("entered_at"):
         raise ApiError("Сначала введите номер на сайте и нажмите «Далее»")
     issued = CODE_AT.get(uid)
